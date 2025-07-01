@@ -408,7 +408,8 @@ class _BudgetCalculationScreenState extends State<BudgetCalculationScreen> {
                     MaterialPageRoute(
                       builder: (context) => ExpenseOptimizationScreen(
                         totalUnplannedExpenses: value,
-                        unplannedExpenses: metrics['unplannedExpensesByCategory'] as Map<String, double>,
+                        unplannedExpensesByCategory:
+                        metrics['unplannedExpensesByCategory'] as Map<String, double>,
                       ),
                     ),
                   );
