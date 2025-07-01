@@ -408,8 +408,7 @@ class _BudgetCalculationScreenState extends State<BudgetCalculationScreen> {
                     MaterialPageRoute(
                       builder: (context) => ExpenseOptimizationScreen(
                         totalUnplannedExpenses: value,
-                        unplannedExpensesByCategory:
-                        metrics['unplannedExpensesByCategory'] as Map<String, double>,
+                        unplannedExpenses: metrics['unplannedExpensesByCategory'] as Map<String, double>,
                       ),
                     ),
                   );
@@ -423,85 +422,86 @@ class _BudgetCalculationScreenState extends State<BudgetCalculationScreen> {
     );
   }
 
-  Widget _buildAnalysisSection(Map<String, dynamic> metrics) {
-    final reserve = metrics['reserve'] as double;
-    final minReserve = metrics['minReserve'] as double;
-    final alpha = metrics['alpha'] as double;
-    String analysis = '';
-    Color color = Colors.green;
+}
 
-    if (reserve < 0) {
-      analysis = 'Внимание! Дефицит бюджета. Рекомендуем сократить расходы.';
-      color = Colors.red;
-    } else if (reserve < minReserve) {
-      analysis = 'Минимальный резерв (рекомендуемый: ${(alpha*100).toInt()}% от дохода). '
-          'Рекомендуем увеличить накопления.';
-      color = Colors.orange;
-    } else {
-      analysis = 'Финансовое положение стабильное. Хороший уровень резерва.';
-    }
+Widget _buildAnalysisSection(Map<String, dynamic> metrics) {
+  final reserve = metrics['reserve'] as double;
+  final minReserve = metrics['minReserve'] as double;
+  final alpha = metrics['alpha'] as double;
+  String analysis = '';
+  Color color = Colors.green;
 
-    return Column(
+  if (reserve < 0) {
+    analysis = 'Внимание! Дефицит бюджета. Рекомендуем сократить расходы.';
+    color = Colors.red;
+  } else if (reserve < minReserve) {
+    analysis = 'Минимальный резерв (рекомендуемый: ${(alpha*100).toInt()}% от дохода). '
+        'Рекомендуем увеличить накопления.';
+    color = Colors.orange;
+  } else {
+    analysis = 'Финансовое положение стабильное. Хороший уровень резерва.';
+  }
+
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      const Text(
+        'Анализ бюджета:',
+        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+      ),
+      const SizedBox(height: 8),
+      Text(
+        analysis,
+        style: TextStyle(fontSize: 16, color: color),
+      ),
+      const SizedBox(height: 16),
+      const Text(
+        'Структура расходов:',
+        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+      ),
+      const SizedBox(height: 8),
+      _buildExpenseStructure(metrics),
+    ],
+  );
+}
+
+Widget _buildExpenseStructure(Map<String, dynamic> metrics) {
+  final totalExpenses = (metrics['mandatoryExpenses'] as double) +
+      (metrics['plannedExpenses'] as double) +
+      (metrics['unplannedExpenses'] as double);
+
+  return Column(
+    children: [
+      _buildProgressRow('Обязательные', metrics['mandatoryExpenses'] as double, totalExpenses, Colors.blue),
+      _buildProgressRow('Запланированные', metrics['plannedExpenses'] as double, totalExpenses, Colors.orange),
+      _buildProgressRow('Незапланированные', metrics['unplannedExpenses'] as double, totalExpenses, Colors.red),
+    ],
+  );
+}
+
+Widget _buildProgressRow(String label, double value, double total, Color color) {
+  final percentage = total > 0 ? (value / total * 100) : 0;
+
+  return Padding(
+    padding: const EdgeInsets.symmetric(vertical: 8.0),
+    child: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
-          'Анализ бюджета:',
-          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text('$label:'),
+            Text('${value.toStringAsFixed(2)} руб. (${percentage.toStringAsFixed(1)}%)'),
+          ],
         ),
-        const SizedBox(height: 8),
-        Text(
-          analysis,
-          style: TextStyle(fontSize: 16, color: color),
+        const SizedBox(height: 4),
+        LinearProgressIndicator(
+          value: percentage / 100,
+          minHeight: 8,
+          backgroundColor: Colors.grey[300],
+          color: color,
         ),
-        const SizedBox(height: 16),
-        const Text(
-          'Структура расходов:',
-          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-        ),
-        const SizedBox(height: 8),
-        _buildExpenseStructure(metrics),
       ],
-    );
-  }
-
-  Widget _buildExpenseStructure(Map<String, dynamic> metrics) {
-    final totalExpenses = (metrics['mandatoryExpenses'] as double) +
-        (metrics['plannedExpenses'] as double) +
-        (metrics['unplannedExpenses'] as double);
-
-    return Column(
-      children: [
-        _buildProgressRow('Обязательные', metrics['mandatoryExpenses'] as double, totalExpenses, Colors.blue),
-        _buildProgressRow('Запланированные', metrics['plannedExpenses'] as double, totalExpenses, Colors.orange),
-        _buildProgressRow('Незапланированные', metrics['unplannedExpenses'] as double, totalExpenses, Colors.red),
-      ],
-    );
-  }
-
-  Widget _buildProgressRow(String label, double value, double total, Color color) {
-    final percentage = total > 0 ? (value / total * 100) : 0;
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8.0),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text('$label:'),
-              Text('${value.toStringAsFixed(2)} руб. (${percentage.toStringAsFixed(1)}%)'),
-            ],
-          ),
-          const SizedBox(height: 4),
-          LinearProgressIndicator(
-            value: percentage / 100,
-            minHeight: 8,
-            backgroundColor: Colors.grey[300],
-            color: color,
-          ),
-        ],
-      ),
-    );
-  }
+    ),
+  );
 }
