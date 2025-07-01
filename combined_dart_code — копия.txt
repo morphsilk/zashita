@@ -1,0 +1,4680 @@
+// Combined Dart files
+// Generated: 2025-06-29 23:19:02
+
+
+// ===== File: lib\database\database_helper.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'dart:async';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart';
+import 'package:path_provider/path_provider.dart';
+import '../models/user.dart';
+import '../models/account.dart';
+import '../models/financial_goal.dart';
+import '../models/family.dart';
+import '../models/account_history.dart';
+import '../services/api_service.dart';
+
+class DatabaseHelper {
+  static final DatabaseHelper _instance = DatabaseHelper._internal();
+  static Database? _database;
+  static const String _baseUrl = 'http://10.0.2.2:5000';
+
+  factory DatabaseHelper() => _instance;
+
+  DatabaseHelper._internal();
+
+  Future<Database> get database async {
+    if (_database != null) return _database!;
+    _database = await _initDatabase();
+    return _database!;
+  }
+
+  Future<int> updateAccount(Account account) async {
+    final db = await database;
+    return await db.update(
+      'accounts',
+      account.toJson(),
+      where: 'number = ?',
+      whereArgs: [account.number],
+    );
+  }
+
+  Future<Database> _initDatabase() async {
+    final documentsDirectory = await getApplicationDocumentsDirectory();
+    final path = join(documentsDirectory.path, 'family_finance.db');
+
+    return await openDatabase(
+      path,
+      version: 1,
+      onCreate: _onCreate,
+    );
+  }
+
+  Future<void> _onCreate(Database db, int version) async {
+    await db.execute('''
+      CREATE TABLE users(
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        email TEXT UNIQUE,
+        password TEXT,
+        familyId TEXT,
+        role TEXT,
+        token TEXT
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE accounts(
+        id TEXT PRIMARY KEY,
+        userId TEXT,
+        name TEXT,
+        balance REAL,
+        number TEXT,
+        type TEXT,
+        currency TEXT,
+        category TEXT,
+        FOREIGN KEY(userId) REFERENCES users(id) ON DELETE CASCADE
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE account_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        accountId TEXT,
+        historyDate TEXT,
+        amount REAL,
+        type TEXT,
+        relatedAccount TEXT,
+        category TEXT,
+        subcategory TEXT,
+        FOREIGN KEY(accountId) REFERENCES accounts(id) ON DELETE CASCADE
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE financial_goals(
+        id TEXT PRIMARY KEY,
+        userId TEXT,
+        description TEXT,
+        requiredAmount REAL,
+        totalAmount REAL,
+        deadlineDate TEXT,
+        accountName TEXT,
+        goalCategory TEXT,
+        FOREIGN KEY(userId) REFERENCES users(id) ON DELETE CASCADE
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE families(
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        inviteCode TEXT
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE family_members(
+        familyId TEXT,
+        userId TEXT,
+        PRIMARY KEY(familyId, userId),
+        FOREIGN KEY(familyId) REFERENCES families(id) ON DELETE CASCADE,
+        FOREIGN KEY(userId) REFERENCES users(id) ON DELETE CASCADE
+      )
+    ''');
+  }
+
+  Future<int> insertUser(User user) async {
+    final db = await database;
+    final userMap = user.toJson();
+
+    // Удаляем историю из счетов перед сохранением
+    for (var account in user.accounts) {
+      account.history = [];
+    }
+
+    return await db.insert('users', userMap, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<User?> getUser(String email) async {
+    final db = await database;
+    final maps = await db.query(
+      'users',
+      where: 'email = ?',
+      whereArgs: [email],
+    );
+
+    if (maps.isNotEmpty) {
+      final user = User.fromJson(maps.first);
+      // Загружаем связанные данные
+      user.accounts = await getAccounts(user.id); // Используем user.id
+      for (final account in user.accounts) {
+        account.history = await getAccountHistory(account.id);
+      }
+      return user;
+    }
+    return null;
+  }
+
+  Future<int> updateUser(User user) async {
+    final db = await database;
+    return await db.update(
+      'users',
+      user.toJson(),
+      where: 'email = ?',
+      whereArgs: [user.email],
+    );
+  }
+
+  // Account CRUD operations
+  Future<int> insertAccount(Account account, String userId) async {
+    final db = await database;
+
+    // Создаем копию без поля 'history'
+    final accountMap = Map<String, dynamic>.from(account.toJson());
+    accountMap.remove('history'); // Удаляем поле истории
+    accountMap['userId'] = userId;
+
+    // Вставляем счет
+    final accountId = await db.insert('accounts', accountMap);
+
+    // Сохраняем историю отдельно
+    for (final history in account.history) {
+      await insertAccountHistory(history, account.number);
+    }
+
+    return accountId;
+  }
+
+  Future<List<Account>> getAccounts(String token) async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/accounts'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as List;
+        final accounts = data.map((json) => Account.fromJson(json)).toList();
+
+        // Загружаем историю для каждого счета
+        for (final account in accounts) {
+          account.history = await ApiService.getAccountHistory(token, account.id);
+        }
+
+        return accounts;
+      }
+      throw Exception('Failed to load accounts');
+    } catch (e) {
+      print('Accounts loading error: $e');
+      rethrow;
+    }
+  }
+  // Account History operations
+  Future<int> insertAccountHistory(AccountHistory history, String accountId) async {
+    final db = await database;
+    final historyMap = history.toJson();
+    historyMap['accountId'] = accountId;
+    return await db.insert('account_history', historyMap);
+  }
+
+  Future<List<AccountHistory>> getAccountHistory(String accountId) async {
+    final db = await database;
+    final historyMaps = await db.query(
+      'account_history',
+      where: 'accountId = ?',
+      whereArgs: [accountId],
+    );
+
+    return historyMaps.map((map) => AccountHistory.fromJson(map)).toList();
+  }
+
+  // Family operations
+  Future<int> insertFamily(Family family) async {
+    final db = await database;
+    await db.insert('families', {
+      'id': family.id,
+      'name': family.name,
+      'inviteCode': family.inviteCode,
+    });
+
+    for (final user in family.users) {
+      await db.insert('family_members', {
+        'familyId': family.id,
+        'userId': user.email, // Using email as user ID
+      });
+    }
+
+    return 1;
+  }
+
+  Future<Family?> getFamily(String familyId) async {
+    final db = await database;
+    final familyMap = await db.query(
+      'families',
+      where: 'id = ?',
+      whereArgs: [familyId],
+      limit: 1,
+    );
+
+    if (familyMap.isEmpty) return null;
+
+    final members = await db.query(
+      'family_members',
+      where: 'familyId = ?',
+      whereArgs: [familyId],
+    );
+
+    final users = <User>[];
+    for (var member in members) {
+      final user = await getUser(member['userId'] as String);
+      if (user != null) {
+        users.add(user);
+      }
+    }
+
+    return Family(
+      id: familyMap.first['id'] as String,
+      name: familyMap.first['name'] as String,
+      users: users,
+      inviteCode: familyMap.first['inviteCode'] as String,
+    );
+  }
+
+  // Close database
+  Future<void> close() async {
+    final db = await database;
+    await db.close();
+  }
+
+  Future<int> updateAccountWithHistory(Account account) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      // Создаем копию без истории
+      final accountMap = Map<String, dynamic>.from(account.toJson());
+      accountMap.remove('history');
+
+      // Обновляем счет
+      await txn.update(
+        'accounts',
+        accountMap,
+        where: 'number = ?',
+        whereArgs: [account.number],
+      );
+
+      // Сохраняем новую историю
+      for (final h in account.history.where((h) => h.id == null)) {
+        await txn.insert('account_history', {
+          'accountId': account.number,
+          'historyDate': h.historyDate.toIso8601String(),
+          'amount': h.amount,
+          'type': h.type,
+          'relatedAccount': h.relatedAccount,
+          'category': h.category,
+          'subcategory': h.subcategory,
+        });
+      }
+    });
+    return 1;
+  }
+
+
+}
+
+// ===== File: lib\main.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'database/database_helper.dart';
+import 'models/user.dart';
+import 'models/family.dart';
+import 'models/account.dart';
+import 'screens/login_screen.dart';
+import 'screens/registration_screen.dart';
+import 'screens/main_screen.dart';
+import 'services/api_service.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  final storage = FlutterSecureStorage();
+  final dbHelper = DatabaseHelper();
+  await dbHelper.database;
+
+  String initialRoute = '/login';
+  Object? initialArguments;
+
+  try {
+    final token = await storage.read(key: 'auth_token');
+    final email = await storage.read(key: 'user_email');
+
+    if (token != null && email != null) {
+      try {
+        // Загружаем профиль с сервера
+        final user = await ApiService.getProfile(token);
+
+        // Загружаем счета с сервера
+        final accounts = await ApiService.getAccounts(token);
+
+        // Загружаем историю для каждого счета
+        for (final account in accounts) {
+          account.history = await ApiService.getAccountHistory(token, account.id);
+        }
+
+        user.accounts = accounts;
+
+        // Сохраняем в локальную базу
+        await dbHelper.insertUser(user);
+        for (final account in accounts) {
+          await dbHelper.insertAccount(account, user.id); // Используем user.id
+          for (final history in account.history) {
+            await dbHelper.insertAccountHistory(history, account.id);
+          }
+        }
+
+        initialRoute = '/main';
+        initialArguments = {
+          'user': user,
+          'family': Family(
+            id: user.familyId,
+            name: "Семья ${user.name}",
+            users: [user],
+            inviteCode: '',
+          ),
+        };
+      } catch (e) {
+        print('Ошибка загрузки данных с сервера: $e');
+        // Попытка загрузки из локальной базы
+        final localUser = await dbHelper.getUser(email);
+        if (localUser != null) {
+          localUser.accounts = await dbHelper.getAccounts(localUser.id); // Используем localUser.id
+          for (final account in localUser.accounts) {
+            account.history = await dbHelper.getAccountHistory(account.id);
+          }
+
+          initialRoute = '/main';
+          initialArguments = {
+            'user': localUser,
+            'family': Family(
+              id: localUser.familyId,
+              name: "Семья ${localUser.name}",
+              users: [localUser],
+              inviteCode: '',
+            ),
+          };
+        }
+      }
+    }
+  } catch (e) {
+    print('Ошибка инициализации: $e');
+    await storage.delete(key: 'auth_token');
+  }
+
+  runApp(FamilyFinanceApp(
+    initialRoute: initialRoute,
+    initialArguments: initialArguments,
+  ));
+}
+
+class FamilyFinanceApp extends StatelessWidget {
+  final String initialRoute;
+  final Object? initialArguments;
+
+  const FamilyFinanceApp({
+    required this.initialRoute,
+    this.initialArguments,
+    Key? key,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Расходы семьи',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        visualDensity: VisualDensity.adaptivePlatformDensity,
+      ),
+      initialRoute: initialRoute,
+      routes: {
+        '/login': (context) =>  LoginScreen(),
+        '/register': (context) =>  RegistrationScreen(),
+        '/main': (context) {
+          final args = initialArguments as Map<String, dynamic>?;
+          return MainScreen(
+            accounts: args?['user']?.accounts ?? [],
+            goals: args?['user']?.goals ?? [],
+            onAddAccount: (newAccount) {
+              // Здесь будет логика добавления счета через API
+            },
+            family: args?['family'] ?? Family(
+              id: '',
+              name: '',
+              users: [],
+              inviteCode: '',
+            ),
+            currentUser: args?['user'] ?? User(
+              id: '',
+              name: '',
+              email: '',
+              password: '',
+              familyId: '',
+              role: UserRole.adult,
+            ),
+          );
+        },
+      },
+      onGenerateRoute: (settings) {
+        if (settings.name == '/main') {
+          final args = settings.arguments as Map<String, dynamic>?;
+          return MaterialPageRoute(
+            builder: (context) => MainScreen(
+              accounts: args?['user']?.accounts ?? [],
+              goals: args?['user']?.goals ?? [],
+              onAddAccount: (newAccount) {},
+              family: args?['family'] ?? Family(
+                id: '',
+                name: '',
+                users: [],
+                inviteCode: '',
+              ),
+              currentUser: args?['user'] ?? User(
+                id: '',
+                name: '',
+                email: '',
+                password: '',
+                familyId: '',
+                role: UserRole.adult,
+              ),
+            ),
+          );
+        }
+        return null;
+      },
+    );
+  }
+}
+
+// ===== File: lib\models\account.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'dart:math';
+import 'package:http/http.dart' as http;
+
+import '../services/api_service.dart';
+import 'account_history.dart';
+import 'package:flutter/foundation.dart'; // Для ChangeNotifier
+
+class Account {
+  String id; // Добавляем id для бэкенда
+  String name;
+  double balance;
+  String number;
+  String type;
+  String currency;
+  String? category;
+  List<AccountHistory> history;
+
+  Account({
+    required this.id,
+    required this.name,
+    required this.balance,
+    required this.number,
+    required this.type,
+    required this.currency,
+    this.category,
+    List<AccountHistory>? history,
+  }) : history = history ?? [];
+
+  Future<void> registerTransaction({
+    required double amount,
+    required String token, // Этот параметр должен быть заполнен
+    String? transferTo,
+    String? category,
+    String? subcategory,
+  }) async {
+    print('Registering transaction for account: $id');
+    final type = transferTo != null
+        ? (amount > 0 ? 'Перевод от' : 'Перевод на')
+        : (amount >= 0 ? 'Доход' : 'Расход');
+
+    try {
+      await ApiService.addTransaction(
+        token: token, // Убедитесь, что передаёте token
+        accountId: id,
+        amount: amount,
+        type: type,
+        relatedAccount: transferTo,
+        category: category,
+        subcategory: subcategory,
+      );
+
+      balance += amount;
+      history.add(AccountHistory(
+        historyDate: DateTime.now(),
+        amount: amount,
+        type: type,
+        relatedAccount: transferTo,
+        category: category,
+        subcategory: subcategory,
+      ));
+    } catch (e) {
+      print('Transaction registration error: $e');
+      rethrow;
+    }
+  }
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'balance': balance,
+    'number': number,
+    'type': type,
+    'currency': currency,
+    'category': category,
+  };
+
+  factory Account.fromJson(Map<String, dynamic> json) => Account(
+    id: json['id'],
+    name: json['name'],
+    balance: json['balance'],
+    number: json['number'],
+    type: json['type'],
+    currency: json['currency'],
+    category: json['category'],
+  );
+}
+
+// ===== File: lib\models\account_history.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+// lib/models/account_history.dart
+class AccountHistory {
+  int? id;
+  DateTime historyDate;
+  double amount;
+  String type;
+  String? relatedAccount;
+  String? category;
+  String? subcategory;
+
+  AccountHistory({
+    this.id,
+    required this.historyDate,
+    required this.amount,
+    required this.type,
+    this.relatedAccount,
+    this.category,
+    this.subcategory,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'historyDate': historyDate.toIso8601String(),
+    'amount': amount,
+    'type': type,
+    'relatedAccount': relatedAccount,
+    'category': category,
+    'subcategory': subcategory,
+  };
+
+  factory AccountHistory.fromJson(Map<String, dynamic> json) => AccountHistory(
+    id: json['id'],
+    historyDate: DateTime.parse(json['historyDate']),
+    amount: json['amount'],
+    type: json['type'],
+    relatedAccount: json['relatedAccount'],
+    category: json['category'],
+    subcategory: json['subcategory'],
+  );
+}
+
+// ===== File: lib\models\category.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+// lib/models/category.dart
+abstract class Category {
+  String get name;
+  List<String> get subcategories;
+}
+
+// ===== File: lib\models\expense_category.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+// lib/models/expense_category.dart
+import 'package:flutter/material.dart';
+import 'category.dart';
+
+class ExpenseCategory implements Category {
+  @override
+  final String name;
+  @override
+  final List<String> subcategories;
+
+  ExpenseCategory({
+    required this.name,
+    required this.subcategories,
+  });
+}
+
+
+final List<ExpenseCategory> expenseCategories = [
+  ExpenseCategory(name: 'Здоровье', subcategories: [
+    'Поликлиники/больницы',
+    'Инструментальные исследования',
+    'Лабораторные исследования (анализы)',
+    'Аптеки',
+    'Косметология',
+    'Стоматология',
+    'Массаж',
+  ]),
+  ExpenseCategory(name: 'Жилье', subcategories: [
+    'Квартплата',
+    'Отопление',
+    'Паркинг',
+    'Горводоканал',
+    'Электроэнергия',
+    'Газ',
+    'Вывоз мусора',
+    'Домофон',
+    'Капремонт',
+    'Аренда жилья',
+  ]),
+  ExpenseCategory(name: 'Связь', subcategories: [
+    'Телевидение',
+    'Мобильная связь',
+    'Интернет',
+  ]),
+  ExpenseCategory(name: 'Транспорт', subcategories: [
+    'Каршеринг',
+    'Аренда авто',
+    'Такси',
+    'Общественный транспорт',
+    'Авиабилеты',
+    'Ж/д билеты и любые другие билеты',
+  ]),
+  ExpenseCategory(name: 'Развлечения', subcategories: [
+    'Кино',
+    'Театры',
+    'Концерты',
+    'Рестораны/кафе',
+    'Подписки (музыка, фильмы)',
+    'Хобби',
+    'Игры',
+  ]),
+  ExpenseCategory(name: 'Спорт', subcategories: [
+    'Тренажерный зал',
+    'Спортивные секции (кружки)',
+    'Бассейн',
+    'Фитнес-тренер',
+    'Спортивная одежда и обувь',
+    'Спортивный инвентарь',
+  ]),
+  ExpenseCategory(name: 'Одежда и обувь', subcategories: [
+    'Одежда и обувь (взрослая, детская)',
+    'Аксессуары',
+  ]),
+  ExpenseCategory(name: 'Кредиты', subcategories: [
+    'Ипотека',
+    'Потребительский кредит',
+    'Кредитная карта',
+    'Автокредит',
+  ]),
+  ExpenseCategory(name: 'Образование', subcategories: [
+    'Школа/детсад',
+    'Курсы/репетиторы',
+    'Секции',
+    'Учебники',
+    'Книги (худож. И др. литература)',
+    'Канцелярия',
+  ]),
+  ExpenseCategory(name: 'Продукты', subcategories: [
+    'Рынки',
+    'Доставка еды',
+    'Фермерские продукты',
+  ]),
+  ExpenseCategory(name: 'Супермаркеты/магазины', subcategories: [
+    'Все покупки без категории в супермаркетах и магазинах',
+  ]),
+  ExpenseCategory(name: 'Маркетплейсы', subcategories: [
+    'Ozon',
+    'WB',
+    'Yandex Market',
+    'Lamoda и т.д.',
+  ]),
+  ExpenseCategory(name: 'Ювелирные изделия', subcategories: [
+    'Украшения (золото, серебро, платина, бижутерия)',
+    'Часы',
+  ]),
+  ExpenseCategory(name: 'Финансовые услуги', subcategories: [
+    'Обмен валюты',
+    'Переводы за границу',
+    'Комиссии банков',
+  ]),
+  ExpenseCategory(name: 'Подарки', subcategories: [
+    'Дни рождения',
+    'Свадьбы',
+    'Новый год и другие праздники',
+  ]),
+  ExpenseCategory(name: 'Праздники', subcategories: [
+    'Украшения',
+    'Банкетные залы',
+    'Тамада',
+    'Фото- и видеосъемка',
+  ]),
+  ExpenseCategory(name: 'Фин. подушка', subcategories: [
+    'Накопления',
+    'Подушка безопасности (2-3 месяца базовых расходов)',
+    'Резерв (3-6 месяцев всех расходов)',
+  ]),
+  ExpenseCategory(name: 'Инвестиции', subcategories: [
+    'Вклады',
+    'Ценные бумаги (акции, облигации и т.д.)',
+    'НПФ',
+    'ПИФы',
+    'Криптовалюта',
+    'Валюта',
+    'Драгметаллы',
+  ]),
+  ExpenseCategory(name: 'Дом/Ремонт', subcategories: [
+    'Мебель (столы, стулья, кровати, шкафы, матрацы, мебель для ванной, спальни, гостиной и т.д.)',
+    'Посуда',
+    'Бытовая химия',
+    'Постельное белье (подушки, одеяла, спальные комплекты и т.д.)',
+    'Ремонт',
+  ]),
+  ExpenseCategory(name: 'Техника', subcategories: [
+    'Бытовая (Холодильник, стиральная машина, посудомоечная и т.д.)',
+    'Смартфоны, умные гаджеты и фототехника',
+    'ТВ, консоли и аудио',
+    'ПК, ноутбуки и периферия',
+    'Аксессуары и т.д.',
+  ]),
+  ExpenseCategory(name: 'Автомобиль', subcategories: [
+    'Бензин',
+    'Ремонт авто',
+    'Страховка авто',
+    'Штрафы',
+    'ТО',
+    'Шины',
+    'Мойка',
+    'Платные дороги',
+    'Гараж',
+    'Эвакуатор',
+    'Шиномонтаж',
+    'Автокомплектующие',
+  ]),
+  ExpenseCategory(name: 'Дети', subcategories: [
+    'Игрушки',
+    'Детские кружки',
+    'Няня',
+    'Праздники',
+    'Школьные сборы',
+  ]),
+  ExpenseCategory(name: 'Питомцы', subcategories: [
+    'Корм',
+    'Ветклиника',
+    'Груминг',
+    'Одежда и аксессуары',
+  ]),
+  ExpenseCategory(name: 'Отпуск', subcategories: [
+    'Отели',
+    'Экскурсии',
+    'Сувениры',
+    'Виза',
+    'Страховка',
+  ]),
+  ExpenseCategory(name: 'Налоги', subcategories: [
+    'НДФЛ',
+    'Имущественный',
+    'Транспортный',
+    'Земельный',
+    'Самозанятость',
+  ]),
+  ExpenseCategory(name: 'Благотворительность', subcategories: [
+    'Помощь приютам и фондам',
+  ]),
+  ExpenseCategory(name: 'Красота', subcategories: [
+    'Парикмахерская',
+    'Маникюр',
+    'Косметика',
+    'СПА-процедуры',
+  ]),
+  ExpenseCategory(name: 'Страхование', subcategories: [
+    'ОМС',
+    'ДМС',
+    'Страхование недвижимости и т.д.',
+  ]),
+  ExpenseCategory(name: 'Государственные услуги', subcategories: [
+    'Госпошлины',
+    'Загранпаспорт',
+    'Водительское удостоверение',
+    'Мед.комиссия',
+  ]),
+  ExpenseCategory(name: 'Экстренные расходы (ЧП)', subcategories: [
+    'Незапланированные траты',
+    'Юридическая помощь',
+  ]),
+  ExpenseCategory(name: 'Прочее', subcategories: [
+    'Химчистка',
+    'Ремонт обуви и одежды',
+    'Клининг',
+  ]),
+];
+
+// ===== File: lib\models\family.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'package:flutter/foundation.dart';
+import 'user.dart';
+
+class Family {
+  final String id;
+  final String name;
+  final List<User> users;
+  final String inviteCode; // Добавляем код приглашения
+
+  Family({
+    required this.id,
+    required this.name,
+    required this.users,
+    this.inviteCode = '',
+  });
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'users': users.map((user) => user.toJson()).toList(),
+    'inviteCode': inviteCode,
+  };
+
+  factory Family.fromJson(Map<String, dynamic> json) => Family(
+    id: json['id'],
+    name: json['name'],
+    users: (json['users'] as List).map((u) => User.fromJson(u)).toList(),
+    inviteCode: json['inviteCode'] ?? '',
+  );
+
+  User? getAdmin() {
+    for (var user in users) {
+      if (user.role == UserRole.admin) {
+        return user;
+      }
+    }
+    return null;
+  }
+}
+
+// ===== File: lib\models\financial_goal.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'package:flutter/foundation.dart';
+
+class FinancialGoal {
+  final String description;
+  final double requiredAmount;
+  double totalAmount;
+  final DateTime deadlineDate;
+  final String accountName;
+  final String goalCategory;
+
+  FinancialGoal({
+    required this.description,
+    required this.requiredAmount,
+    this.totalAmount = 0.0,
+    required this.deadlineDate,
+    required this.accountName,
+    required this.goalCategory,
+  });
+
+  bool checkCompletion() {
+    return totalAmount >= requiredAmount;
+  }
+
+  Map<String, dynamic> toJson() => {
+    'description': description,
+    'requiredAmount': requiredAmount,
+    'totalAmount': totalAmount,
+    'deadlineDate': deadlineDate.toIso8601String(),
+    'accountName': accountName,
+    'goalCategory': goalCategory,
+  };
+
+  factory FinancialGoal.fromJson(Map<String, dynamic> json) => FinancialGoal(
+    description: json['description'],
+    requiredAmount: json['requiredAmount'],
+    totalAmount: json['totalAmount'] ?? 0.0,
+    deadlineDate: DateTime.parse(json['deadlineDate']),
+    accountName: json['accountName'],
+    goalCategory: json['goalCategory'] ?? 'На цель: ${json['description']}',
+  );
+}
+
+// ===== File: lib\models\income_category.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+// lib/models/income_category.dart
+import 'package:flutter/material.dart';
+import 'category.dart';
+
+class IncomeCategory implements Category {
+  @override
+  final String name;
+  @override
+  final List<String> subcategories;
+
+  IncomeCategory({
+    required this.name,
+    required this.subcategories,
+  });
+}
+
+final List<IncomeCategory> incomeCategories = [
+  IncomeCategory(name: 'Зарплата', subcategories: [
+    'Основная работа',
+    'Подработка',
+    'Премия',
+  ]),
+  IncomeCategory(name: 'Инвестиции', subcategories: [
+    'Дивиденды',
+    'Проценты по вкладам',
+    'Продажа акций',
+  ]),
+  IncomeCategory(name: 'Подарки', subcategories: [
+    'День рождения',
+    'Новый год',
+    'Свадьба',
+  ]),
+  IncomeCategory(name: 'Прочее', subcategories: [
+    'Возврат долга',
+    'Кэшбэк',
+    'Лотерея',
+  ]),
+];
+
+// ===== File: lib\models\user.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'package:flutter/foundation.dart';
+import 'account.dart';
+import 'financial_goal.dart';
+
+enum UserRole {
+  admin,
+  adult,
+  child,
+}
+
+class User {
+  final String id;
+  final String name;
+  final String email;
+  final String password;
+  final String familyId;
+  final UserRole role;
+  final String? token;
+  List<Account> accounts;
+  List<FinancialGoal> goals;
+
+  User copyWith({
+    String? id,
+    String? name,
+    String? email,
+    String? password,
+    String? familyId,
+    UserRole? role,
+    List<Account>? accounts,
+    List<FinancialGoal>? goals,
+  }) {
+    return User(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      email: email ?? this.email,
+      password: password ?? this.password,
+      familyId: familyId ?? this.familyId,
+      role: role ?? this.role,
+      accounts: accounts ?? List.from(this.accounts),
+      goals: goals ?? List.from(this.goals),
+    );
+  }
+
+  User({
+    required this.id,
+    required this.name,
+    required this.email,
+    required this.password,
+    required this.familyId,
+    required this.role,
+    this.accounts = const [],
+    this.goals = const [],
+    this.token,
+  }) {
+    accounts = List.from(accounts);
+    goals = List.from(goals);
+  }
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'email': email,
+    'password': password,
+    'familyId': familyId,
+    'role': role.toString().split('.').last, // Сохраняем как строку
+    'accounts': accounts.map((account) => account.toJson()).toList(),
+    'goals': goals.map((goal) => goal.toJson()).toList(),
+    'token': token,
+  };
+
+  factory User.fromJson(Map<String, dynamic> json) => User(
+    id: json['id'],
+    name: json['name'] ?? '',
+    email: json['email'] ?? '',
+    password: json['password'] ?? '',
+    familyId: json['familyId'] ?? '',
+    role: UserRole.values.firstWhere(
+          (e) => e.toString().split('.').last == (json['role'] ?? 'adult'),
+      orElse: () => UserRole.adult,
+    ),
+    token: json['token'] ?? '',
+  )..accounts = (json['accounts'] as List?)
+      ?.map((a) => Account.fromJson(a))
+      .toList() ?? []
+    ..goals = (json['goals'] as List?)
+        ?.map((g) => FinancialGoal.fromJson(g))
+        .toList() ?? [];
+}
+
+// ===== File: lib\screens\add_account_screen.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'package:flutter/material.dart';
+import '../models/account.dart';
+import '../models/user.dart';
+import '../database/database_helper.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import '../services/api_service.dart';
+import 'package:uuid/uuid.dart';
+
+class AddAccountScreen extends StatefulWidget {
+  final User currentUser;
+  final Function(Account) onAddAccount;
+
+  const AddAccountScreen({
+    required this.currentUser,
+    required this.onAddAccount,
+    Key? key,
+  }) : super(key: key);
+
+  @override
+  _AddAccountScreenState createState() => _AddAccountScreenState();
+}
+
+class _AddAccountScreenState extends State<AddAccountScreen> {
+  final _formKey = GlobalKey<FormState>();
+  String _name = '';
+  double _balance = 0.0;
+  String _type = 'Наличные';
+  String _currency = 'RUB';
+  String? _category;
+  bool _useCategory = false;
+
+  final FlutterSecureStorage _storage = const FlutterSecureStorage();
+
+  final List<String> _categories = [
+    'Ежедневные расходы',
+    'Сбережения',
+    'Инвестиции',
+    'Другое',
+  ];
+
+  final List<String> _types = [
+    'Наличные',
+    'Карта',
+    'Банковский счёт',
+    'Кредит',
+    'Депозит',
+  ];
+
+  final List<String> _currencies = [
+    'RUB',
+    'USD',
+    'EUR',
+  ];
+
+  void _saveAccount() async {
+    if (_formKey.currentState!.validate()) {
+      _formKey.currentState!.save();
+
+      final newAccount = Account(
+        id: Uuid().v4(), // Генерируем временный ID
+        name: _useCategory ? _category! : _name,
+        balance: _balance,
+        number: Uuid().v4().substring(0, 8),
+        type: _type,
+        currency: _currency,
+        category: _useCategory ? _category : null,
+      );
+
+      try {
+        // 1. Сохраняем в локальную БД
+        final dbHelper = DatabaseHelper();
+        await dbHelper.insertAccount(newAccount, widget.currentUser.id);
+
+        // 2. Сохраняем на сервер
+        final token = await _storage.read(key: 'auth_token');
+        if (token != null) {
+          await ApiService.addAccount(
+            token: token,
+            account: newAccount,
+
+          );
+        }
+
+        // 3. Вызываем колбэк для синхронизации
+        widget.onAddAccount(newAccount);
+
+        // 4. Закрываем экран
+        Navigator.pop(context);
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Ошибка сохранения: $e')),
+        );
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Добавить счёт')),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Form(
+          key: _formKey,
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                SwitchListTile(
+                  title: const Text('Выбрать из категорий'),
+                  value: _useCategory,
+                  onChanged: (value) {
+                    setState(() {
+                      _useCategory = value;
+                      if (value && _category == null) {
+                        _category = _categories[0];
+                      }
+                    });
+                  },
+                ),
+                if (_useCategory)
+                  DropdownButtonFormField<String>(
+                    decoration: const InputDecoration(labelText: 'Категория'),
+                    value: _category,
+                    items: _categories.map((category) {
+                      return DropdownMenuItem<String>(
+                        value: category,
+                        child: Text(category),
+                      );
+                    }).toList(),
+                    onChanged: (value) {
+                      setState(() {
+                        _category = value;
+                      });
+                    },
+                    validator: (value) =>
+                    value == null ? 'Выберите категорию' : null,
+                  )
+                else
+                  TextFormField(
+                    decoration: const InputDecoration(labelText: 'Название счёта'),
+                    validator: (value) =>
+                    value!.isEmpty ? 'Введите название' : null,
+                    onSaved: (value) => _name = value!,
+                  ),
+                TextFormField(
+                  decoration: const InputDecoration(labelText: 'Текущий баланс'),
+                  keyboardType: TextInputType.numberWithOptions(decimal: true),
+                  validator: (value) {
+                    if (value!.isEmpty) return 'Введите баланс';
+                    if (double.tryParse(value) == null) return 'Введите число';
+                    return null;
+                  },
+                  onSaved: (value) => _balance = double.parse(value!),
+                ),
+                DropdownButtonFormField<String>(
+                  decoration: const InputDecoration(labelText: 'Тип счёта'),
+                  value: _type,
+                  items: _types.map((type) {
+                    return DropdownMenuItem<String>(
+                      value: type,
+                      child: Text(type),
+                    );
+                  }).toList(),
+                  onChanged: (value) {
+                    setState(() {
+                      _type = value!;
+                    });
+                  },
+                  validator: (value) => value == null ? 'Выберите тип' : null,
+                ),
+                DropdownButtonFormField<String>(
+                  decoration: const InputDecoration(labelText: 'Валюта'),
+                  value: _currency,
+                  items: _currencies.map((currency) {
+                    return DropdownMenuItem<String>(
+                      value: currency,
+                      child: Text(currency),
+                    );
+                  }).toList(),
+                  onChanged: (value) {
+                    setState(() {
+                      _currency = value!;
+                    });
+                  },
+                  validator: (value) => value == null ? 'Выберите валюту' : null,
+                ),
+                const SizedBox(height: 20),
+                ElevatedButton(
+                  onPressed: _saveAccount,
+                  child: const Text('Сохранить'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ===== File: lib\screens\analytics_screen.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+// lib/screens/analytics_screen.dart
+import 'package:flutter/material.dart';
+import 'package:fl_chart/fl_chart.dart';
+import '../models/account.dart';
+import '../models/account_history.dart';
+
+class AnalyticsScreen extends StatefulWidget {
+  final List<Account> accounts;
+
+  AnalyticsScreen({required this.accounts});
+
+  @override
+  _AnalyticsScreenState createState() => _AnalyticsScreenState();
+}
+
+class _AnalyticsScreenState extends State<AnalyticsScreen> {
+  String _selectedPeriod = 'Месяц';
+  DateTime _startDate = DateTime.now().subtract(Duration(days: 30));
+  DateTime _endDate = DateTime.now();
+  bool _showIncomeChart = false;
+  String? _selectedCategory;
+  String? _selectedAccountNumber; // Используем number вместо id
+  int? _touchedIndex;
+
+  final Map<String, IconData> _categoryIcons = {
+    'Зарплата': Icons.attach_money,
+    'Зарплата: Премия': Icons.star,
+    'Зарплата: Основная': Icons.account_balance_wallet,
+    'Инвестиции': Icons.trending_up,
+    'Инвестиции: Дивиденды': Icons.pie_chart,
+    'Подарки': Icons.card_giftcard,
+    'Подарки: День рождения': Icons.cake,
+    'Продукты': Icons.fastfood,
+    'Продукты: Доставка еды': Icons.delivery_dining,
+    'Продукты: Супермаркет': Icons.shopping_cart,
+    'Жилье': Icons.home,
+    'Жилье: Квартплата': Icons.receipt,
+    'Жилье: Ремонт': Icons.build,
+    'Транспорт': Icons.directions_car,
+    'Транспорт: Общественный': Icons.directions_bus,
+    'Транспорт: Такси': Icons.local_taxi,
+    'Развлечения': Icons.movie,
+    'Развлечения: Кино': Icons.local_movies,
+    'Развлечения: Концерты': Icons.music_note,
+    'Здоровье': Icons.local_hospital,
+    'Здоровье: Лекарства': Icons.medical_services,
+    'Здоровье: Врачи': Icons.person_search,
+    'Прочее': Icons.category,
+    'Прочее: Подписки': Icons.subscriptions,
+    'Прочее: Пожертвования': Icons.volunteer_activism,
+    'Без категории': Icons.help_outline,
+    'Без подкатегории': Icons.help_outline,
+  };
+
+  Map<String, double> get _incomeByCategory {
+    Map<String, double> result = {};
+    for (var account in widget.accounts) {
+      if (_selectedAccountNumber == null || account.number == _selectedAccountNumber) {
+        for (var history in account.history) {
+          if (history.amount > 0 &&
+              history.historyDate.isAfter(_startDate.subtract(Duration(seconds: 1))) &&
+              history.historyDate.isBefore(_endDate.add(Duration(days: 1)))) {
+            final category = history.category ?? 'Без категории';
+            result[category] = (result[category] ?? 0) + history.amount;
+          }
+        }
+      }
+    }
+    return result;
+  }
+
+  Map<String, double> get _expensesByCategory {
+    Map<String, double> result = {};
+    for (var account in widget.accounts) {
+      if (_selectedAccountNumber == null || account.number == _selectedAccountNumber) {
+        for (var history in account.history) {
+          if (history.amount < 0 &&
+              history.historyDate.isAfter(_startDate.subtract(Duration(seconds: 1))) &&
+              history.historyDate.isBefore(_endDate.add(Duration(days: 1)))) {
+            final category = history.category ?? 'Без категории';
+            result[category] = (result[category] ?? 0) + (-history.amount);
+          }
+        }
+      }
+    }
+    return result;
+  }
+
+  Map<String, double> get _expensesBySubcategory {
+    Map<String, double> result = {};
+    if (_selectedCategory == null) return result;
+    for (var account in widget.accounts) {
+      if (_selectedAccountNumber == null || account.number == _selectedAccountNumber) {
+        for (var history in account.history) {
+          if (history.amount < 0 &&
+              history.historyDate.isAfter(_startDate.subtract(Duration(seconds: 1))) &&
+              history.historyDate.isBefore(_endDate.add(Duration(days: 1))) &&
+              history.category == _selectedCategory) {
+            final subcategory = history.subcategory ?? 'Без подкатегории';
+            result[subcategory] = (result[subcategory] ?? 0) + (-history.amount);
+          }
+        }
+      }
+    }
+    return result;
+  }
+
+  Map<String, double> get _averageExpenses {
+    Map<String, double> result = {};
+    final daysInPeriod = _endDate.difference(_startDate).inDays + 1;
+    final monthsInPeriod = (daysInPeriod / 30).toDouble(); // Не округляем, используем дробное значение
+    if (_selectedCategory != null) {
+      for (var account in widget.accounts) {
+        if (_selectedAccountNumber == null || account.number == _selectedAccountNumber) {
+          for (var history in account.history) {
+            if (history.amount < 0 &&
+                history.historyDate.isAfter(_startDate.subtract(Duration(seconds: 1))) &&
+                history.historyDate.isBefore(_endDate.add(Duration(days: 1))) &&
+                history.category == _selectedCategory) {
+              final key = history.subcategory ?? _selectedCategory!;
+              result[key] = (result[key] ?? 0) + (-history.amount);
+            }
+          }
+        }
+      }
+      result.forEach((key, value) {
+        result[key] = daysInPeriod <= 31 ? value : value / monthsInPeriod; // Среднее за месяц
+      });
+    }
+    return result;
+  }
+
+  double get _totalIncome => _incomeByCategory.values.fold(0, (sum, value) => sum + value);
+  double get _totalExpenses => _expensesByCategory.values.fold(0, (sum, value) => sum + value);
+  double get _totalSelectedExpenses => _expensesByCategory[_selectedCategory] ?? 0;
+
+  Future<void> _selectDateRange(BuildContext context) async {
+    final DateTimeRange? picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: DateTime.now(),
+      initialDateRange: DateTimeRange(start: _startDate, end: _endDate),
+    );
+    if (picked != null) {
+      setState(() {
+        _startDate = picked.start;
+        _endDate = picked.end;
+        _selectedPeriod = 'Пользовательский';
+      });
+    }
+  }
+
+  String get _periodDisplay {
+    if (_selectedPeriod == 'Пользовательский') {
+      return '${_startDate.toString().substring(0, 10)} - ${_endDate.toString().substring(0, 10)}';
+    }
+    return _selectedPeriod;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final chartData = _showIncomeChart ? _incomeByCategory : (_selectedCategory != null ? _expensesBySubcategory : _expensesByCategory);
+    final chartTitle = _showIncomeChart ? 'Доходы по категориям' : (_selectedCategory != null ? 'Расходы по подкатегориям ($_selectedCategory)' : 'Расходы по категориям');
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Аналитика'),
+        actions: [
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              setState(() {
+                _selectedPeriod = value;
+                if (value == 'Месяц') {
+                  _startDate = DateTime.now().subtract(Duration(days: 30));
+                  _endDate = DateTime.now();
+                } else if (value == '3 месяца') {
+                  _startDate = DateTime.now().subtract(Duration(days: 90));
+                  _endDate = DateTime.now();
+                } else if (value == 'Год') {
+                  _startDate = DateTime.now().subtract(Duration(days: 365));
+                  _endDate = DateTime.now();
+                }
+              });
+            },
+            itemBuilder: (context) => [
+              PopupMenuItem(value: 'Месяц', child: Text('Месяц')),
+              PopupMenuItem(value: '3 месяца', child: Text('3 месяца')),
+              PopupMenuItem(value: 'Год', child: Text('Год')),
+              PopupMenuItem(value: 'Пользовательский', child: Text('Выбрать период')),
+            ],
+            icon: Icon(Icons.filter_list),
+          ),
+          IconButton(
+            icon: Icon(Icons.date_range),
+            onPressed: () => _selectDateRange(context),
+          ),
+        ],
+      ),
+      body: SingleChildScrollView(
+        child: Padding(
+          padding: EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Период: $_periodDisplay',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              SizedBox(height: 16),
+              Text(
+                'Выберите счёт:',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+              DropdownButton<String>(
+                value: _selectedAccountNumber,
+                hint: Text('Все счета'),
+                items: [
+                  DropdownMenuItem<String>(
+                    value: null,
+                    child: Text('Все счета'),
+                  ),
+                  ...widget.accounts.map((account) => DropdownMenuItem<String>(
+                    value: account.number,
+                    child: Text(account.name, overflow: TextOverflow.ellipsis),
+                  )),
+                ],
+                onChanged: (value) => setState(() => _selectedAccountNumber = value),
+              ),
+              SizedBox(height: 16),
+              Text(
+                'Доходы: ${_totalIncome.toStringAsFixed(2)} руб.',
+                style: TextStyle(fontSize: 16, color: Colors.green),
+              ),
+              ..._incomeByCategory.entries.map((entry) => Padding(
+                padding: EdgeInsets.only(left: 16, top: 4),
+                child: Text(
+                  '${entry.key}: ${entry.value.toStringAsFixed(2)} руб.',
+                  overflow: TextOverflow.ellipsis,
+                ),
+              )),
+              SizedBox(height: 16),
+              Text(
+                'Расходы: ${_totalExpenses.toStringAsFixed(2)} руб.',
+                style: TextStyle(fontSize: 16, color: Colors.red),
+              ),
+              ..._expensesByCategory.entries.map((entry) => Padding(
+                padding: EdgeInsets.only(left: 16, top: 4),
+                child: Text(
+                  '${entry.key}: ${entry.value.toStringAsFixed(2)} руб.',
+                  overflow: TextOverflow.ellipsis,
+                ),
+              )),
+              SizedBox(height: 16),
+              if (!_showIncomeChart && _expensesByCategory.isNotEmpty) ...[
+                Text(
+                  'Выберите категорию:',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+                DropdownButton<String>(
+                  value: _selectedCategory,
+                  hint: Text('Все категории'),
+                  items: [
+                    DropdownMenuItem<String>(
+                      value: null,
+                      child: Text('Все категории'),
+                    ),
+                    ..._expensesByCategory.keys.map((category) => DropdownMenuItem<String>(
+                      value: category,
+                      child: Text(category, overflow: TextOverflow.ellipsis),
+                    )),
+                  ],
+                  onChanged: (value) => setState(() => _selectedCategory = value),
+                ),
+                if (_selectedCategory != null) ...[
+                  SizedBox(height: 16),
+                  Text(
+                    'Средние расходы за $_periodDisplay:',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                  ..._averageExpenses.entries.map((entry) => Padding(
+                    padding: EdgeInsets.only(left: 16, top: 4),
+                    child: Text(
+                      'По "${entry.key}": ${entry.value.toStringAsFixed(2)} руб.',
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  )),
+                ],
+              ],
+              SizedBox(height: 16),
+              Text(
+                chartTitle,
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+              SizedBox(height: 8),
+              ElevatedButton(
+                onPressed: () => setState(() => _showIncomeChart = !_showIncomeChart),
+                child: Text(_showIncomeChart ? 'Показать расходы' : 'Показать доходы'),
+              ),
+              SizedBox(height: 16),
+              SizedBox(
+                height: 200,
+                child: chartData.isEmpty
+                    ? Center(child: Text('Нет данных для отображения'))
+                    : PieChart(
+                  PieChartData(
+                    sections: chartData.entries.map((entry) {
+                      final index = chartData.keys.toList().indexOf(entry.key);
+                      final total = _showIncomeChart ? _totalIncome : (_selectedCategory != null ? _totalSelectedExpenses : _totalExpenses);
+                      return PieChartSectionData(
+                        value: entry.value,
+                        title: '${(entry.value / total * 100).toStringAsFixed(1)}%',
+                        color: Colors.primaries[index % Colors.primaries.length],
+                        radius: _touchedIndex == index ? 90 : 80,
+                        titleStyle: TextStyle(fontSize: 12, color: Colors.white),
+                      );
+                    }).toList(),
+                    sectionsSpace: 2,
+                    centerSpaceRadius: 40,
+                    pieTouchData: PieTouchData(
+                      touchCallback: (FlTouchEvent event, pieTouchResponse) {
+                        setState(() {
+                          if (event is FlTapDownEvent && pieTouchResponse != null && pieTouchResponse.touchedSection != null) {
+                            _touchedIndex = pieTouchResponse.touchedSection!.touchedSectionIndex;
+                          } else if (event is FlTapUpEvent || event is FlLongPressEnd) {
+                            _touchedIndex = null;
+                          }
+                        });
+                      },
+                    ),
+                  ),
+                ),
+              ),
+              SizedBox(height: 16),
+              if (chartData.isNotEmpty) ...[
+                Text(
+                  'Категории:',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+                ...chartData.entries.map((entry) {
+                  final index = chartData.keys.toList().indexOf(entry.key);
+                  final color = Colors.primaries[index % Colors.primaries.length];
+                  final icon = _categoryIcons[entry.key] ?? Icons.category;
+                  final isHighlighted = _touchedIndex == index;
+                  return Padding(
+                    padding: EdgeInsets.only(left: 16, top: 4),
+                    child: Container(
+                      color: isHighlighted ? Colors.grey[200] : null,
+                      padding: EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+                      child: Row(
+                        children: [
+                          Icon(icon, size: 20, color: color),
+                          SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              '${entry.key}: ${entry.value.toStringAsFixed(2)} руб.',
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontWeight: isHighlighted ? FontWeight.bold : FontWeight.normal,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                }),
+              ],
+              SizedBox(height: 16),
+              Text(
+                'Рекомендации:',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+              Text(
+                _totalExpenses > _totalIncome
+                    ? 'Ваши расходы превышают доходы. Попробуйте сократить траты в категориях с наибольшими суммами.'
+                    : _totalExpenses < _totalIncome
+                    ? 'Ваши доходы превышают расходы. Рассмотрите возможность инвестирования излишков.'
+                    : 'Ваши доходы равны расходам. Старайтесь поддерживать баланс или планировать бюджет для будущих целей.',
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ===== File: lib\screens\budget_calculation_screen.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'package:flutter/material.dart';
+import '../models/account.dart';
+import '../models/account_history.dart';
+
+class BudgetCalculationScreen extends StatefulWidget {
+  final List<Account> accounts;
+
+  const BudgetCalculationScreen({required this.accounts});
+
+  @override
+  _BudgetCalculationScreenState createState() => _BudgetCalculationScreenState();
+}
+
+class _BudgetCalculationScreenState extends State<BudgetCalculationScreen> {
+  double _reservePercentage = 10.0; // Процент резерва по умолчанию
+
+  // Рассчитывает основные финансовые показатели по формулам
+  Map<String, dynamic> calculateBudgetMetrics() {
+    double totalIncome = 0;
+    double mandatoryExpenses = 0;
+    double plannedExpenses = 0;
+    double unplannedExpenses = 0;
+    double reserve = 0;
+    double alpha = _reservePercentage / 100; // Используем выбранный процент
+
+    Map<String, double> incomeByCategory = {
+      'Зарплаты': 0,
+      'Инвестиции': 0,
+      'Пособия': 0,
+      'Другие': 0
+    };
+
+    // Группируем расходы по типам
+    Map<String, double> mandatoryExpensesByCategory = {
+      'ЖКХ': 0,
+      'Питание': 0,
+      'Транспорт': 0,
+      'Кредиты': 0,
+      'Медицина': 0,
+    };
+
+    Map<String, double> plannedExpensesByCategory = {
+      'Образование': 0,
+      'Хобби': 0,
+      'Красота': 0,
+      'Супермаркеты': 0,
+      'Подарки': 0,
+    };
+
+    Map<String, double> unplannedExpensesByCategory = {
+      'Развлечения': 0,
+      'Спорт': 0,
+      'Одежда': 0,
+      'Маркетплейсы': 0,
+      'Прочее': 0
+    };
+
+    for (final account in widget.accounts) {
+      for (final history in account.history) {
+        final amount = history.amount;
+        final category = history.category ?? '';
+        final subcategory = history.subcategory ?? '';
+
+        if (amount > 0) {
+          totalIncome += amount;
+
+          if (category == 'Зарплата') {
+            incomeByCategory['Зарплаты'] = incomeByCategory['Зарплаты']! + amount;
+          } else if (category == 'Инвестиции') {
+            incomeByCategory['Инвестиции'] = incomeByCategory['Инвестиции']! + amount;
+          } else if (category == 'Пособия') {
+            incomeByCategory['Пособия'] = incomeByCategory['Пособия']! + amount;
+          } else {
+            incomeByCategory['Другие'] = incomeByCategory['Другие']! + amount;
+          }
+        }
+        else if (amount < 0) {
+          final absAmount = amount.abs();
+
+          if (category == 'Жилье') {
+            mandatoryExpenses += absAmount;
+            mandatoryExpensesByCategory['ЖКХ'] = mandatoryExpensesByCategory['ЖКХ']! + absAmount;
+          }
+          else if (category == 'Продукты') {
+            mandatoryExpenses += absAmount;
+            mandatoryExpensesByCategory['Питание'] = mandatoryExpensesByCategory['Питание']! + absAmount;
+          }
+          else if (category == 'Транспорт') {
+            mandatoryExpenses += absAmount;
+            mandatoryExpensesByCategory['Транспорт'] = mandatoryExpensesByCategory['Транспорт']! + absAmount;
+          }
+          else if (category == 'Кредиты') {
+            mandatoryExpenses += absAmount;
+            mandatoryExpensesByCategory['Кредиты'] = mandatoryExpensesByCategory['Кредиты']! + absAmount;
+          }
+          else if (category == 'Здоровье') {
+            mandatoryExpenses += absAmount;
+            mandatoryExpensesByCategory['Медицина'] = mandatoryExpensesByCategory['Медицина']! + absAmount;
+          }
+          else if (category == 'Образование') {
+            plannedExpenses += absAmount;
+            plannedExpensesByCategory['Образование'] = plannedExpensesByCategory['Образование']! + absAmount;
+          }
+          else if (category == 'Хобби' || subcategory == 'Хобби') {
+            plannedExpenses += absAmount;
+            plannedExpensesByCategory['Хобби'] = plannedExpensesByCategory['Хобби']! + absAmount;
+          }
+          else if (category == 'Красота') {
+            plannedExpenses += absAmount;
+            plannedExpensesByCategory['Красота'] = plannedExpensesByCategory['Красота']! + absAmount;
+          }
+          else if (category == 'Супермаркеты/магазины') {
+            plannedExpenses += absAmount;
+            plannedExpensesByCategory['Супермаркеты'] = plannedExpensesByCategory['Супермаркеты']! + absAmount;
+          }
+          else if (category == 'Подарки') {
+            plannedExpenses += absAmount;
+            plannedExpensesByCategory['Подарки'] = plannedExpensesByCategory['Подарки']! + absAmount;
+          }
+          else if (category == 'Развлечения') {
+            unplannedExpenses += absAmount;
+            unplannedExpensesByCategory['Развлечения'] = unplannedExpensesByCategory['Развлечения']! + absAmount;
+          }
+          else if (category == 'Спорт') {
+            unplannedExpenses += absAmount;
+            unplannedExpensesByCategory['Спорт'] = unplannedExpensesByCategory['Спорт']! + absAmount;
+          }
+          else if (category == 'Одежда и обувь') {
+            unplannedExpenses += absAmount;
+            unplannedExpensesByCategory['Одежда'] = unplannedExpensesByCategory['Одежда']! + absAmount;
+          }
+          else if (category == 'Маркетплейсы') {
+            unplannedExpenses += absAmount;
+            unplannedExpensesByCategory['Маркетплейсы'] = unplannedExpensesByCategory['Маркетплейсы']! + absAmount;
+          }
+          else if (category == 'Прочее') {
+            unplannedExpenses += absAmount;
+            unplannedExpensesByCategory['Прочее'] = unplannedExpensesByCategory['Прочее']! + absAmount;
+          }
+        }
+      }
+    }
+
+    reserve = totalIncome - (mandatoryExpenses + plannedExpenses + unplannedExpenses);
+    double minReserve = totalIncome * alpha;
+
+    return {
+      'totalIncome': totalIncome,
+      'mandatoryExpenses': mandatoryExpenses,
+      'plannedExpenses': plannedExpenses,
+      'unplannedExpenses': unplannedExpenses,
+      'reserve': reserve,
+      'minReserve': minReserve,
+      'alpha': alpha,
+      'incomeByCategory': incomeByCategory,
+      'mandatoryExpensesByCategory': mandatoryExpensesByCategory,
+      'plannedExpensesByCategory': plannedExpensesByCategory,
+      'unplannedExpensesByCategory': unplannedExpensesByCategory,
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final metrics = calculateBudgetMetrics();
+    final incomeByCategory = metrics['incomeByCategory'] as Map<String, double>;
+    final mandatoryExpensesByCategory = metrics['mandatoryExpensesByCategory'] as Map<String, double>;
+    final plannedExpensesByCategory = metrics['plannedExpensesByCategory'] as Map<String, double>;
+    final unplannedExpensesByCategory = metrics['unplannedExpensesByCategory'] as Map<String, double>;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Расчет бюджета')),
+      body: SingleChildScrollView(
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Доходы по категориям
+              const Text(
+                'Доходы по категориям:',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 10),
+              ...incomeByCategory.entries.map((entry) {
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8.0),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(entry.key),
+                      Text('${entry.value.toStringAsFixed(2)} руб.'),
+                    ],
+                  ),
+                );
+              }).toList(),
+              const SizedBox(height: 20),
+
+              // Основные метрики
+              _buildMetricCard(
+                'Общий доход семьи',
+                metrics['totalIncome'] as double,
+                Colors.green,
+                Icons.arrow_upward,
+              ),
+              const SizedBox(height: 16),
+              _buildMetricCard(
+                'Обязательные расходы',
+                metrics['mandatoryExpenses'] as double,
+                Colors.blue,
+                Icons.home,
+              ),
+              const SizedBox(height: 16),
+              _buildMetricCard(
+                'Запланированные расходы',
+                metrics['plannedExpenses'] as double,
+                Colors.orange,
+                Icons.calendar_today,
+              ),
+              const SizedBox(height: 16),
+              _buildMetricCard(
+                'Незапланированные расходы',
+                metrics['unplannedExpenses'] as double,
+                Colors.red,
+                Icons.warning,
+              ),
+              const SizedBox(height: 16),
+              _buildMetricCard(
+                'Финансовый резерв',
+                metrics['reserve'] as double,
+                (metrics['reserve'] as double) >= 0 ? Colors.green : Colors.red,
+                (metrics['reserve'] as double) >= 0 ? Icons.savings : Icons.error,
+              ),
+              const SizedBox(height: 16),
+
+              // Настройка резерва (перемещена сюда)
+              Card(
+                elevation: 4,
+                margin: const EdgeInsets.only(bottom: 24),
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Настройка резерва:',
+                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 16),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              'Размер резерва: ${_reservePercentage.toStringAsFixed(1)}%',
+                              style: const TextStyle(fontSize: 16),
+                            ),
+                          ),
+                          Icon(Icons.settings, color: Colors.blue),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      Slider(
+                        value: _reservePercentage,
+                        min: 0,
+                        max: 50,
+                        divisions: 50,
+                        label: _reservePercentage.toStringAsFixed(1),
+                        onChanged: (value) {
+                          setState(() {
+                            _reservePercentage = value;
+                          });
+                        },
+                      ),
+                      Text(
+                        'Рекомендуемый резерв: ${(metrics['minReserve'] as double).toStringAsFixed(2)} руб.',
+                        style: const TextStyle(fontSize: 14),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Текущий резерв: ${(metrics['reserve'] as double).toStringAsFixed(2)} руб.',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.bold,
+                          color: (metrics['reserve'] as double) >= (metrics['minReserve'] as double)
+                              ? Colors.green
+                              : Colors.red,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+              // Анализ
+              _buildAnalysisSection(metrics),
+
+              // Детализация расходов по группам
+              const SizedBox(height: 24),
+              _buildExpenseGroup(
+                'Обязательные расходы',
+                mandatoryExpensesByCategory,
+                Icons.lock_clock,
+                Colors.blue,
+              ),
+              const SizedBox(height: 24),
+              _buildExpenseGroup(
+                'Запланированные расходы',
+                plannedExpensesByCategory,
+                Icons.calendar_month,
+                Colors.orange,
+              ),
+              const SizedBox(height: 24),
+              _buildExpenseGroup(
+                'Незапланированные расходы',
+                unplannedExpensesByCategory,
+                Icons.warning,
+                Colors.red,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildExpenseGroup(String title, Map<String, double> expenses, IconData icon, Color color) {
+    double total = expenses.values.fold(0, (sum, value) => sum + value);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(icon, color: color, size: 28),
+            const SizedBox(width: 8),
+            Text(
+              title,
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: color),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Text(
+          'Итого: ${total.toStringAsFixed(2)} руб.',
+          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 10),
+        ...expenses.entries.map((entry) {
+          if (entry.value > 0) {
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 8.0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(entry.key),
+                  Text('${entry.value.toStringAsFixed(2)} руб.'),
+                ],
+              ),
+            );
+          }
+          return const SizedBox.shrink();
+        }).toList(),
+      ],
+    );
+  }
+
+  Widget _buildMetricCard(String title, double value, Color color, IconData icon) {
+    return Card(
+      elevation: 4,
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Row(
+          children: [
+            Icon(icon, color: color, size: 40),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title, style: const TextStyle(fontSize: 16)),
+                  Text(
+                    '${value.toStringAsFixed(2)} руб.',
+                    style: TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                      color: color,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAnalysisSection(Map<String, dynamic> metrics) {
+    final reserve = metrics['reserve'] as double;
+    final minReserve = metrics['minReserve'] as double;
+    final alpha = metrics['alpha'] as double;
+    String analysis = '';
+    Color color = Colors.green;
+
+    if (reserve < 0) {
+      analysis = 'Внимание! Дефицит бюджета. Рекомендуем сократить расходы.';
+      color = Colors.red;
+    } else if (reserve < minReserve) {
+      analysis = 'Минимальный резерв (рекомендуемый: ${(alpha*100).toInt()}% от дохода). '
+          'Рекомендуем увеличить накопления.';
+      color = Colors.orange;
+    } else {
+      analysis = 'Финансовое положение стабильное. Хороший уровень резерва.';
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Анализ бюджета:',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          analysis,
+          style: TextStyle(fontSize: 16, color: color),
+        ),
+        const SizedBox(height: 16),
+        const Text(
+          'Структура расходов:',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 8),
+        _buildExpenseStructure(metrics),
+      ],
+    );
+  }
+
+  Widget _buildExpenseStructure(Map<String, dynamic> metrics) {
+    final totalExpenses = (metrics['mandatoryExpenses'] as double) +
+        (metrics['plannedExpenses'] as double) +
+        (metrics['unplannedExpenses'] as double);
+
+    return Column(
+      children: [
+        _buildProgressRow('Обязательные', metrics['mandatoryExpenses'] as double, totalExpenses, Colors.blue),
+        _buildProgressRow('Запланированные', metrics['plannedExpenses'] as double, totalExpenses, Colors.orange),
+        _buildProgressRow('Незапланированные', metrics['unplannedExpenses'] as double, totalExpenses, Colors.red),
+      ],
+    );
+  }
+
+  Widget _buildProgressRow(String label, double value, double total, Color color) {
+    final percentage = total > 0 ? (value / total * 100) : 0;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('$label:'),
+              Text('${value.toStringAsFixed(2)} руб. (${percentage.toStringAsFixed(1)}%)'),
+            ],
+          ),
+          const SizedBox(height: 4),
+          LinearProgressIndicator(
+            value: percentage / 100,
+            minHeight: 8,
+            backgroundColor: Colors.grey[300],
+            color: color,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ===== File: lib\screens\family_invite_screen.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'package:flutter/material.dart';
+import '../services/api_service.dart';
+import '../models/user.dart';
+
+class FamilyInviteScreen extends StatefulWidget {
+  const FamilyInviteScreen({Key? key}) : super(key: key);
+
+  @override
+  _FamilyInviteScreenState createState() => _FamilyInviteScreenState();
+}
+
+class _FamilyInviteScreenState extends State<FamilyInviteScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _inviteCodeController = TextEditingController();
+  final _nameController = TextEditingController();
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
+  bool _isLoading = false;
+
+  Future<void> _joinFamily() async {
+    if (_formKey.currentState!.validate()) {
+      setState(() => _isLoading = true);
+
+      try {
+        final user = await ApiService.joinFamily(
+          inviteCode: _inviteCodeController.text,
+          name: _nameController.text,
+          email: _emailController.text,
+          password: _passwordController.text,
+        );
+
+        Navigator.popUntil(context, (route) => route.isFirst);
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Ошибка: $e')),
+        );
+      } finally {
+        setState(() => _isLoading = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Присоединиться к семье')),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Form(
+          key: _formKey,
+          child: ListView(
+            children: [
+              TextFormField(
+                controller: _nameController,
+                decoration: const InputDecoration(labelText: 'Имя'),
+                validator: (value) => value!.isEmpty ? 'Введите имя' : null,
+              ),
+              TextFormField(
+                controller: _emailController,
+                decoration: const InputDecoration(labelText: 'Email'),
+                keyboardType: TextInputType.emailAddress,
+                validator: (value) => value!.isEmpty ? 'Введите email' : null,
+              ),
+              TextFormField(
+                controller: _passwordController,
+                decoration: const InputDecoration(labelText: 'Пароль'),
+                obscureText: true,
+                validator: (value) => value!.isEmpty ? 'Введите пароль' : null,
+              ),
+              TextFormField(
+                controller: _inviteCodeController,
+                decoration: const InputDecoration(
+                  labelText: 'Код приглашения',
+                  hintText: 'Получите его у администратора семьи',
+                ),
+                validator: (value) => value!.isEmpty ? 'Введите код' : null,
+              ),
+              const SizedBox(height: 20),
+              ElevatedButton(
+                onPressed: _isLoading ? null : _joinFamily,
+                child: _isLoading
+                    ? const CircularProgressIndicator()
+                    : const Text('Присоединиться'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ===== File: lib\screens\family_management_screen.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import '../models/user.dart';
+
+class FamilyManagementScreen extends StatefulWidget {
+  final List<User> familyUsers;
+  final Function(User) onAddFamilyMember;
+  final Function(User) onRemoveFamilyMember;
+  final Function(User, UserRole) onUpdateRole;
+
+  const FamilyManagementScreen({
+    required this.familyUsers,
+    required this.onAddFamilyMember,
+    required this.onRemoveFamilyMember,
+    required this.onUpdateRole,
+    Key? key,
+  }) : super(key: key);
+
+  @override
+  _FamilyManagementScreenState createState() => _FamilyManagementScreenState();
+}
+
+class _FamilyManagementScreenState extends State<FamilyManagementScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _nameController = TextEditingController();
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
+  UserRole _role = UserRole.adult;
+  String _generatedInviteCode = '';
+  bool _showInviteSection = false;
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _emailController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  void _generateInviteCode() {
+    setState(() {
+      final familyId = widget.familyUsers.first.familyId;
+      final randomDigits = DateTime.now().millisecondsSinceEpoch.toString().substring(7, 11);
+      _generatedInviteCode = '${familyId.substring(0, 4)}$randomDigits';
+      _showInviteSection = true;
+    });
+  }
+
+  Future<void> _copyToClipboard() async {
+    await Clipboard.setData(ClipboardData(text: _generatedInviteCode));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Код скопирован в буфер обмена')),
+    );
+  }
+
+  void _addFamilyMember() {
+    if (_formKey.currentState!.validate()) {
+      final newUser = User(
+        id: '',
+        name: _nameController.text,
+        email: _emailController.text,
+        password: _passwordController.text,
+        familyId: widget.familyUsers.first.familyId,
+        role: _role,
+      );
+      widget.onAddFamilyMember(newUser);
+
+      // Очищаем поля после добавления
+      _nameController.clear();
+      _emailController.clear();
+      _passwordController.clear();
+      setState(() => _role = UserRole.adult);
+    }
+  }
+
+  void _removeUser(User user) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Удалить пользователя?'),
+        content: Text('Вы уверены, что хотите удалить ${user.name} из семьи?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Отмена'),
+          ),
+          TextButton(
+            onPressed: () {
+              widget.onRemoveFamilyMember(user);
+              Navigator.pop(context);
+            },
+            child: const Text('Удалить', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _updateUserRole(User user, UserRole newRole) {
+    if (user.role != newRole) {
+      widget.onUpdateRole(user, newRole);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final adminUsers = widget.familyUsers.where((u) => u.role == UserRole.admin).toList();
+    final canChangeRoles = adminUsers.length > 1;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Управление семьёй')),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Члены семьи:', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Expanded(
+              child: ListView.builder(
+                itemCount: widget.familyUsers.length,
+                itemBuilder: (context, index) {
+                  final user = widget.familyUsers[index];
+                  return ListTile(
+                    title: Text(user.name),
+                    subtitle: Text('${user.email} • ${user.role.toString().split('.').last}'),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (user.role != UserRole.admin || canChangeRoles)
+                          DropdownButton<UserRole>(
+                            value: user.role,
+                            items: UserRole.values.map((role) {
+                              return DropdownMenuItem<UserRole>(
+                                value: role,
+                                child: Text(role.toString().split('.').last),
+                              );
+                            }).toList(),
+                            onChanged: (newRole) {
+                              if (newRole != null) {
+                                _updateUserRole(user, newRole);
+                              }
+                            },
+                          ),
+                        IconButton(
+                          icon: const Icon(Icons.delete, color: Colors.red),
+                          onPressed: () => _removeUser(user),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 16),
+            ElevatedButton(
+              onPressed: _generateInviteCode,
+              child: const Text('Сгенерировать код приглашения'),
+            ),
+            if (_showInviteSection) ...[
+              const SizedBox(height: 16),
+              const Text('Код приглашения:', style: TextStyle(fontWeight: FontWeight.bold)),
+              GestureDetector(
+                onTap: _copyToClipboard,
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.blue),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        _generatedInviteCode,
+                        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                      ),
+                      const Icon(Icons.content_copy, color: Colors.blue),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Нажмите на код, чтобы скопировать. Отправьте его тому, кого хотите пригласить.',
+                style: TextStyle(color: Colors.grey, fontSize: 12),
+              ),
+            ],
+            const SizedBox(height: 16),
+            const Text('Добавить нового члена:', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Form(
+              key: _formKey,
+              child: Column(
+                children: [
+                  TextFormField(
+                    controller: _nameController,
+                    decoration: const InputDecoration(labelText: 'Имя'),
+                    validator: (value) => value!.isEmpty ? 'Введите имя' : null,
+                  ),
+                  TextFormField(
+                    controller: _emailController,
+                    decoration: const InputDecoration(labelText: 'Email'),
+                    keyboardType: TextInputType.emailAddress,
+                    validator: (value) => !RegExp(r'^[^@]+@[^@]+\.[^@]+').hasMatch(value!)
+                        ? 'Введите корректный email'
+                        : null,
+                  ),
+                  TextFormField(
+                    controller: _passwordController,
+                    decoration: const InputDecoration(labelText: 'Пароль'),
+                    obscureText: true,
+                    validator: (value) => value!.length < 8 ? 'Минимум 8 символов' : null,
+                  ),
+                  DropdownButtonFormField<UserRole>(
+                    decoration: const InputDecoration(labelText: 'Роль'),
+                    value: _role,
+                    items: UserRole.values.map((role) {
+                      return DropdownMenuItem<UserRole>(
+                        value: role,
+                        child: Text(role.toString().split('.').last),
+                      );
+                    }).toList(),
+                    onChanged: (value) => setState(() => _role = value!),
+                  ),
+                  const SizedBox(height: 20),
+                  ElevatedButton(
+                    onPressed: _addFamilyMember,
+                    child: const Text('Добавить'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ===== File: lib\screens\goals_budget_screen.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'package:flutter/material.dart';
+import '../models/account.dart';
+import '../models/financial_goal.dart';
+
+class GoalsBudgetScreen extends StatefulWidget {
+  final List<Account> accounts;
+  final List<FinancialGoal> goals;
+
+  GoalsBudgetScreen({required this.accounts, required this.goals});
+
+  @override
+  _GoalsBudgetScreenState createState() => _GoalsBudgetScreenState();
+}
+
+class _GoalsBudgetScreenState extends State<GoalsBudgetScreen> {
+  String? _selectedAccountName;
+
+  @override
+  void initState() {
+    super.initState();
+    _updateGoalsProgress();
+  }
+
+  void _updateGoalsProgress() {
+    for (var goal in widget.goals) {
+      final account = widget.accounts.firstWhere((acc) => acc.name == goal.accountName);
+      goal.totalAmount = account.history
+          .where((history) => history.category == goal.goalCategory && history.amount > 0)
+          .fold(0.0, (sum, history) => sum + history.amount);
+    }
+  }
+
+  void _addGoal() async {
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => _GoalDialog(accounts: widget.accounts),
+    );
+    if (result != null) {
+      setState(() {
+        final newGoal = FinancialGoal(
+          description: result['description'],
+          requiredAmount: result['requiredAmount'],
+          deadlineDate: result['deadlineDate'],
+          accountName: result['accountName'],
+          goalCategory: 'На цель: ${result['description']}',
+        );
+        widget.goals.add(newGoal);
+        _updateGoalsProgress();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Цели и бюджет'),
+      ),
+      body: Padding(
+        padding: EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Выберите счёт:',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+            DropdownButton<String>(
+              value: _selectedAccountName,
+              hint: Text('Все счета'),
+              items: [
+                DropdownMenuItem<String>(
+                  value: null,
+                  child: Text('Все счета'),
+                ),
+                ...widget.accounts.map((account) => DropdownMenuItem<String>(
+                  value: account.name,
+                  child: Text(account.name, overflow: TextOverflow.ellipsis),
+                )),
+              ],
+              onChanged: (value) {
+                setState(() {
+                  _selectedAccountName = value;
+                  _updateGoalsProgress();
+                });
+              },
+            ),
+            SizedBox(height: 16),
+            Text(
+              'Цели:',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+            Expanded(
+              child: ListView.builder(
+                itemCount: widget.goals.length,
+                itemBuilder: (context, index) {
+                  final goal = widget.goals[index];
+                  if (_selectedAccountName != null && goal.accountName != _selectedAccountName) {
+                    return SizedBox.shrink();
+                  }
+                  final isCompleted = goal.checkCompletion();
+                  final remaining = goal.requiredAmount - goal.totalAmount;
+                  return ListTile(
+                    title: Text(
+                      goal.description,
+                      style: TextStyle(
+                        color: isCompleted ? Colors.green : null,
+                        fontWeight: isCompleted ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
+                    subtitle: Text(
+                      'Накоплено: ${goal.totalAmount.toStringAsFixed(2)} руб.\n'
+                          'Осталось: ${remaining > 0 ? remaining.toStringAsFixed(2) : "0.00"} руб.\n'
+                          'Срок: ${goal.deadlineDate.toString().substring(0, 10)}',
+                    ),
+                    trailing: Icon(
+                      isCompleted ? Icons.check_circle : Icons.circle_outlined,
+                      color: isCompleted ? Colors.green : null,
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: _addGoal,
+        child: Icon(Icons.add),
+      ),
+    );
+  }
+}
+
+class _GoalDialog extends StatefulWidget {
+  final List<Account> accounts;
+
+  _GoalDialog({required this.accounts});
+
+  @override
+  __GoalDialogState createState() => __GoalDialogState();
+}
+
+class __GoalDialogState extends State<_GoalDialog> {
+  final _descriptionController = TextEditingController();
+  final _amountController = TextEditingController();
+  DateTime _deadlineDate = DateTime.now().add(Duration(days: 30));
+  String? _accountName = null; // Начальное значение null, но счёт обязателен
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.accounts.isNotEmpty) {
+      _accountName = widget.accounts.first.name; // Устанавливаем первый счёт по умолчанию
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('Новая цель'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _descriptionController,
+              decoration: InputDecoration(labelText: 'Описание цели'),
+            ),
+            TextField(
+              controller: _amountController,
+              decoration: InputDecoration(labelText: 'Требуемая сумма (руб.)'),
+              keyboardType: TextInputType.number,
+            ),
+            SizedBox(height: 16),
+            Text('Срок: ${_deadlineDate.toString().substring(0, 10)}'),
+            ElevatedButton(
+              onPressed: () async {
+                final picked = await showDatePicker(
+                  context: context,
+                  initialDate: _deadlineDate,
+                  firstDate: DateTime.now(),
+                  lastDate: DateTime.now().add(Duration(days: 365 * 10)),
+                );
+                if (picked != null) setState(() => _deadlineDate = picked);
+              },
+              child: Text('Выбрать дату'),
+            ),
+            SizedBox(height: 16),
+            DropdownButtonFormField<String>(
+              value: _accountName,
+              decoration: InputDecoration(labelText: 'Счёт'),
+              items: widget.accounts.map((account) => DropdownMenuItem<String>(
+                value: account.name,
+                child: Text(account.name, overflow: TextOverflow.ellipsis),
+              )).toList(),
+              onChanged: (value) => setState(() => _accountName = value),
+              validator: (value) => value == null ? 'Выберите счёт' : null,
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: Text('Отмена'),
+        ),
+        TextButton(
+          onPressed: () {
+            final description = _descriptionController.text;
+            final requiredAmount = double.tryParse(_amountController.text) ?? 0.0;
+            final accountName = _accountName;
+            if (description.isNotEmpty && requiredAmount > 0 && accountName != null) {
+              Navigator.pop(context, {
+                'description': description,
+                'requiredAmount': requiredAmount,
+                'deadlineDate': _deadlineDate,
+                'accountName': accountName,
+              });
+            } else {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Заполните все поля')),
+              );
+            }
+          },
+          child: Text('Добавить'),
+        ),
+      ],
+    );
+  }
+}
+
+// ===== File: lib\screens\history_screen.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+// lib/screens/history_screen.dart
+import 'package:flutter/material.dart';
+import '../models/account.dart';
+import '../models/account_history.dart';
+import '../models/income_category.dart';
+import '../models/expense_category.dart';
+
+class HistoryScreen extends StatefulWidget {
+  final List<Account> accounts;
+
+  HistoryScreen({required this.accounts});
+
+  @override
+  _HistoryScreenState createState() => _HistoryScreenState();
+}
+
+class _HistoryScreenState extends State<HistoryScreen> {
+  String _filterType = 'Все';
+  DateTime? _startDate;
+  DateTime? _endDate;
+  String? _filterAccount;
+  String? _filterCategory;
+
+  List<AccountHistory> get _allHistory {
+    List<AccountHistory> history = [];
+    for (var account in widget.accounts) {
+      history.addAll(account.history.map((h) => AccountHistory(
+        historyDate: h.historyDate,
+        amount: h.amount,
+        type: h.type,
+        relatedAccount: h.relatedAccount,
+        category: h.category,
+        subcategory: h.subcategory,
+      )));
+    }
+    history.sort((a, b) => b.historyDate.compareTo(a.historyDate)); // LIFO
+    return history;
+  }
+
+  List<AccountHistory> get _filteredHistory {
+    var filtered = _allHistory;
+    if (_filterType != 'Все') {
+      filtered = filtered.where((h) => h.type.contains(_filterType)).toList();
+    }
+    if (_startDate != null) {
+      filtered = filtered.where((h) => h.historyDate.isAfter(_startDate!.subtract(Duration(seconds: 1)))).toList();
+    }
+    if (_endDate != null) {
+      filtered = filtered.where((h) => h.historyDate.isBefore(_endDate!.add(Duration(days: 1)))).toList();
+    }
+    if (_filterAccount != null) {
+      filtered = filtered.where((h) {
+        final owningAccount = widget.accounts.firstWhere((a) => a.history.any((ah) => ah.historyDate == h.historyDate && ah.amount == h.amount && ah.type == h.type));
+        return owningAccount.name == _filterAccount || h.relatedAccount == _filterAccount;
+      }).toList();
+    }
+    if (_filterCategory != null) {
+      filtered = filtered.where((h) => h.category == _filterCategory).toList();
+    }
+    return filtered;
+  }
+
+  Future<void> _selectDateRange(BuildContext context) async {
+    final DateTimeRange? picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: DateTime.now(),
+      initialDateRange: _startDate != null && _endDate != null
+          ? DateTimeRange(start: _startDate!, end: _endDate!)
+          : null,
+    );
+    if (picked != null) {
+      setState(() {
+        _startDate = picked.start;
+        _endDate = picked.end;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('История операций'),
+        actions: [
+          IconButton(
+            icon: Icon(Icons.date_range),
+            onPressed: () => _selectDateRange(context),
+          ),
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              setState(() {
+                _filterType = value;
+              });
+            },
+            itemBuilder: (context) => [
+              PopupMenuItem(value: 'Все', child: Text('Все')),
+              PopupMenuItem(value: 'Доход', child: Text('Доходы')),
+              PopupMenuItem(value: 'Расход', child: Text('Расходы')),
+            ],
+            icon: Icon(Icons.filter_list),
+          ),
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              setState(() {
+                _filterAccount = value == 'Все' ? null : value;
+              });
+            },
+            itemBuilder: (context) => [
+              PopupMenuItem(value: 'Все', child: Text('Все счета')),
+              ...widget.accounts.map((account) => PopupMenuItem(value: account.name, child: Text(account.name))),
+            ],
+            icon: Icon(Icons.account_balance),
+          ),
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              setState(() {
+                _filterCategory = value == 'Все' ? null : value;
+              });
+            },
+            itemBuilder: (context) => [
+              PopupMenuItem(value: 'Все', child: Text('Все категории')),
+              ...incomeCategories.map((category) => PopupMenuItem(value: category.name, child: Text(category.name))),
+              ...expenseCategories.map((category) => PopupMenuItem(value: category.name, child: Text(category.name))),
+              ..._allHistory
+                  .where((h) => h.category != null &&
+                  !incomeCategories.any((c) => c.name == h.category) &&
+                  !expenseCategories.any((c) => c.name == h.category))
+                  .map((h) => h.category!)
+                  .toSet()
+                  .map((category) => PopupMenuItem(value: category, child: Text(category))),
+            ],
+            icon: Icon(Icons.category),
+          ),
+        ],
+      ),
+      body: _allHistory.isEmpty
+          ? Center(child: Text('Нет операций'))
+          : Column(
+        children: [
+          if (_startDate != null || _endDate != null || _filterAccount != null || _filterCategory != null)
+            Padding(
+              padding: EdgeInsets.all(8.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (_startDate != null || _endDate != null)
+                    Text(
+                      'Фильтр по дате: ${_startDate?.toString().substring(0, 10) ?? 'Любая'} - ${_endDate?.toString().substring(0, 10) ?? 'Любая'}',
+                      style: TextStyle(fontSize: 16),
+                    ),
+                  if (_filterAccount != null)
+                    Text(
+                      'Фильтр по счёту: $_filterAccount',
+                      style: TextStyle(fontSize: 16),
+                    ),
+                  if (_filterCategory != null)
+                    Text(
+                      'Фильтр по категории: $_filterCategory',
+                      style: TextStyle(fontSize: 16),
+                    ),
+                ],
+              ),
+            ),
+          Expanded(
+            child: ListView.builder(
+              itemCount: _filteredHistory.length,
+              itemBuilder: (context, index) {
+                final history = _filteredHistory[index];
+                return ListTile(
+                  title: Text(
+                    '${history.type}${history.relatedAccount != null ? ' ${history.relatedAccount}' : ''}: ${history.amount.toStringAsFixed(2)}',
+                  ),
+                  subtitle: Text(
+                    '${history.historyDate.toString()}${history.category != null ? ' • ${history.category}${history.subcategory != null ? ': ${history.subcategory}' : ''}' : ''}',
+                  ),
+                  trailing: Icon(
+                    history.amount > 0 || history.type.contains('Перевод от') ? Icons.arrow_upward : Icons.arrow_downward,
+                    color: history.amount > 0 || history.type.contains('Перевод от') ? Colors.green : Colors.red,
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ===== File: lib\screens\login_screen.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'package:flutter/material.dart';
+import 'dart:io'; // Добавляем для SocketException
+import '../models/user.dart';
+import '../models/family.dart';
+import 'main_navigation.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import '../services/api_service.dart';
+
+class LoginScreen extends StatefulWidget {
+  @override
+  _LoginScreenState createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
+  final storage = FlutterSecureStorage(); // Инициализация хранилища
+  bool _isLoading = false; // Добавляем переменную состояния загрузки
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _login() async {
+    if (_formKey.currentState!.validate()) {
+      setState(() => _isLoading = true);
+      try {
+        final user = await ApiService.login(
+          _emailController.text,
+          _passwordController.text,
+        );
+
+        await storage.write(key: 'auth_token', value: user.token!);
+        await storage.write(key: 'user_email', value: user.email!);
+
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (_) => MainNavigation(
+              family: Family(
+                id: user.familyId,
+                name: "Семья ${user.name}",
+                users: [user],
+              ),
+            ),
+          ),
+        );
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.toString())),
+        );
+      } finally {
+        if (mounted) {
+          setState(() => _isLoading = false);
+        }
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text('Вход')),
+      body: Padding(
+        padding: EdgeInsets.all(16.0),
+        child: Form(
+          key: _formKey,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              TextFormField(
+                controller: _emailController,
+                decoration: InputDecoration(labelText: 'Email'),
+                keyboardType: TextInputType.emailAddress,
+                validator: (value) => !RegExp(r'^[^@]+@[^@]+\.[^@]+').hasMatch(value!)
+                    ? 'Введите корректный email'
+                    : null,
+              ),
+              TextFormField(
+                controller: _passwordController,
+                decoration: InputDecoration(labelText: 'Пароль'),
+                obscureText: true,
+                validator: (value) =>
+                value!.isEmpty ? 'Введите пароль' : null,
+              ),
+              SizedBox(height: 20),
+              ElevatedButton(
+                onPressed: _isLoading ? null : _login,
+                child: _isLoading
+                    ? CircularProgressIndicator()
+                    : Text('Войти'),
+              ),
+              TextButton(
+                onPressed: _isLoading ? null : () => Navigator.pushNamed(context, '/register'),
+                child: Text('Нет аккаунта? Зарегистрироваться'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ===== File: lib\screens\main_navigation.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart'; // Добавить
+import 'dart:convert'; // Добавить для jsonEncode/jsonDecode
+import 'main_screen.dart';
+import 'history_screen.dart';
+import 'analytics_screen.dart';
+import 'goals_budget_screen.dart';
+import 'family_management_screen.dart';
+import '../models/account.dart';
+import '../models/financial_goal.dart';
+import '../models/user.dart';
+import '../models/family.dart';
+import '../database/database_helper.dart';
+
+class MainNavigation extends StatefulWidget {
+  final Family family;
+
+  const MainNavigation({required this.family, Key? key}) : super(key: key);
+
+  @override
+  _MainNavigationState createState() => _MainNavigationState();
+}
+
+class _MainNavigationState extends State<MainNavigation> {
+  int _currentTabIndex = 0;
+  late User _currentUser;
+  late Family _currentFamily;
+  final DatabaseHelper _dbHelper = DatabaseHelper();
+
+  @override
+  void initState() {
+    super.initState();
+    _currentFamily = widget.family;
+    _currentUser = _findCurrentUser(_currentFamily.users);
+    _loadFamilyState();
+  }
+
+  Future<void> _loadFamilyState() async {
+    final family = await _dbHelper.getFamily(_currentFamily.id);
+    if (family != null) {
+      setState(() {
+        _currentFamily = family;
+        _currentUser = _findCurrentUser(_currentFamily.users);
+      });
+    }
+  }
+
+  Future<void> _saveFamilyState() async {
+    await _dbHelper.insertFamily(_currentFamily);
+    for (final user in _currentFamily.users) {
+      await _dbHelper.insertUser(user);
+      for (final account in user.accounts) {
+        await _dbHelper.insertAccount(account, user.email);
+        for (final history in account.history) {
+          await _dbHelper.insertAccountHistory(history, account.number);
+        }
+      }
+    }
+  }
+
+  User _findCurrentUser(List<User> familyUsers) {
+    try {
+      return familyUsers.firstWhere(
+            (user) => user.email == familyUsers.first.email,
+        orElse: () => familyUsers.first,
+      );
+    } catch (e) {
+      return User(
+        id: '',
+        name: 'Гость',
+        email: '',
+        password: '',
+        familyId: '',
+        role: UserRole.adult,
+      );
+    }
+  }
+
+  void _onTabTapped(int index) {
+    setState(() {
+      _currentTabIndex = index;
+    });
+  }
+
+  void _handleAddAccount(Account newAccount) {
+    setState(() {
+      _currentUser.accounts.add(newAccount);
+      _saveFamilyState();
+    });
+  }
+
+  void _handleRemoveFamilyMember(User user) {
+    setState(() {
+      _currentFamily.users.removeWhere((u) => u.email == user.email);
+      _saveFamilyState();
+    });
+  }
+
+  void _handleUpdateRole(User user, UserRole newRole) {
+    setState(() {
+      final index = _currentFamily.users.indexWhere((u) => u.email == user.email);
+      if (index != -1) {
+        _currentFamily.users[index] = user.copyWith(role: newRole);
+        _saveFamilyState();
+      }
+    });
+  }
+
+  void _handleAddFamilyMember(User newUser) {
+    setState(() {
+      _currentFamily.users.add(newUser);
+      _saveFamilyState();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${newUser.name} добавлен в семью')),
+      );
+    });
+  }
+
+  void _navigateToFamilyManagement() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => FamilyManagementScreen(
+          familyUsers: _currentFamily.users,
+          onAddFamilyMember: _handleAddFamilyMember,
+          onRemoveFamilyMember: _handleRemoveFamilyMember,
+          onUpdateRole: _handleUpdateRole,
+        ),
+      ),
+    ).then((_) => _saveFamilyState());
+  }
+
+  List<Widget> _buildScreens() {
+    final familyAccounts = _currentUser.role == UserRole.child
+        ? _currentUser.accounts
+        : _currentFamily.users.expand((user) => user.accounts).toList();
+
+    final familyGoals = _currentUser.role == UserRole.child
+        ? _currentUser.goals
+        : _currentFamily.users.expand((user) => user.goals).toList();
+
+    return [
+      MainScreen(
+        accounts: familyAccounts,
+        goals: familyGoals,
+        onAddAccount: _currentUser.role != UserRole.child ? _handleAddAccount : null,
+        family: _currentFamily,
+        currentUser: _currentUser,
+        onManageFamily: _currentUser.role == UserRole.admin ? _navigateToFamilyManagement : null,
+      ),
+      HistoryScreen(accounts: familyAccounts),
+      AnalyticsScreen(accounts: familyAccounts),
+      GoalsBudgetScreen(accounts: familyAccounts, goals: familyGoals),
+    ];
+  }
+  @override
+  Widget build(BuildContext context) {
+    final screens = _buildScreens();
+    final familyAccounts = _currentUser.role == UserRole.child
+        ? _currentUser.accounts
+        : _currentFamily.users.expand((user) => user.accounts).toList();
+
+    return Scaffold(
+      body: IndexedStack(
+        index: _currentTabIndex,
+        children: screens,
+      ),
+      bottomNavigationBar: BottomNavigationBar(
+        items: const [
+          BottomNavigationBarItem(icon: Icon(Icons.home), label: 'Главная'),
+          BottomNavigationBarItem(icon: Icon(Icons.history), label: 'История'),
+          BottomNavigationBarItem(icon: Icon(Icons.analytics), label: 'Аналитика'),
+          BottomNavigationBarItem(icon: Icon(Icons.flag), label: 'Цели'),
+        ],
+        currentIndex: _currentTabIndex,
+        selectedItemColor: Colors.blue,
+        unselectedItemColor: Colors.grey,
+        onTap: _onTabTapped,
+        type: BottomNavigationBarType.fixed,
+      ),
+    );
+  }
+  void dispose() {
+    _saveFamilyState();
+    super.dispose();
+  }
+}
+
+// ===== File: lib\screens\main_screen.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'package:flutter/material.dart';
+import '../database/database_helper.dart';
+import '../models/account.dart';
+import '../models/income_category.dart';
+import '../models/expense_category.dart';
+import '../models/category.dart';
+import '../models/financial_goal.dart';
+import '../models/user.dart';
+import '../models/family.dart';
+import '../services/api_service.dart';
+import 'add_account_screen.dart';
+import 'analytics_screen.dart';
+import 'goals_budget_screen.dart';
+import 'family_management_screen.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'profile_screen.dart';
+
+class MainScreen extends StatefulWidget {
+  final List<Account> accounts;
+  final List<FinancialGoal> goals;
+  final void Function(Account)? onAddAccount;
+  final Family family;
+  final User currentUser;
+  final VoidCallback? onManageFamily;
+
+  MainScreen({
+    required this.accounts,
+    required this.goals,
+    required this.onAddAccount,
+    required this.family,
+    required this.currentUser,
+    this.onManageFamily,
+  });
+
+  @override
+  _MainScreenState createState() => _MainScreenState();
+}
+
+class _MainScreenState extends State<MainScreen> {
+  late List<Account> _accounts;
+  final DatabaseHelper _dbHelper = DatabaseHelper();
+  bool _isLoading = true;
+  final FlutterSecureStorage _storage = const FlutterSecureStorage();
+
+  Future<void> _refreshAccounts() async {
+    setState(() => _isLoading = true);
+    await _syncAccounts();
+    setState(() => _isLoading = false);
+  }
+
+  Future<void> _syncAccounts() async {
+    final token = await _storage.read(key: 'auth_token');
+    if (token != null) {
+      try {
+        final serverAccounts = await ApiService.getAccounts(token);
+
+        // Отладочная информация
+        print('Syncing accounts. Server accounts: ${serverAccounts.length}');
+
+        setState(() {
+          _accounts = serverAccounts; // Полная замена локальных данных
+        });
+      } catch (e) {
+        print('Ошибка синхронизации счетов: $e');
+      }
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _accounts = widget.accounts;
+    _loadAccountsFromDatabase();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _syncAccounts();
+    });
+  }
+
+  Future<void> _loadAccountsFromDatabase() async {
+    try {
+      final accounts = await _dbHelper.getAccounts(widget.currentUser.email);
+      setState(() {
+        _accounts = accounts;
+        _isLoading = false;
+      });
+      _syncAccounts();
+    } catch (e) {
+      print('Ошибка загрузки счетов: $e');
+      setState(() {
+        _accounts = widget.accounts;
+        _isLoading = false;
+      });
+    }
+  }
+
+  double get totalBalance {
+    return _accounts
+        .where((account) => account.currency == 'RUB')
+        .fold(0, (sum, account) => sum + account.balance);
+  }
+
+  void _showAddMenu(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      builder: (BuildContext context) {
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.account_balance),
+              title: const Text('Добавить счёт'),
+              onTap: () {
+                Navigator.pop(context);
+                _addAccount(context);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.arrow_upward),
+              title: const Text('Добавить доход'),
+              onTap: () {
+                Navigator.pop(context);
+                _showTransactionDialog(context, true);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.arrow_downward),
+              title: const Text('Добавить расход'),
+              onTap: () {
+                Navigator.pop(context);
+                _showTransactionDialog(context, false);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.swap_horiz),
+              title: const Text('Перевод между счетами'),
+              onTap: () {
+                Navigator.pop(context);
+                _showTransferDialog(context);
+              },
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _addAccount(BuildContext context) async {
+    await Navigator.push<Account>(
+      context,
+      MaterialPageRoute(
+        builder: (context) => AddAccountScreen(
+          currentUser: widget.currentUser,
+          onAddAccount: (newAccount) {
+            // Только синхронизация, без локального добавления
+            _syncAccounts();
+            return newAccount;
+          },
+        ),
+      ),
+    );
+  }
+
+  void _showTransactionDialog(BuildContext context, bool isIncome) {
+    Account? selectedAccount;
+    double amount = 0.0;
+    Category? selectedCategory;
+    String? selectedSubcategory;
+    bool showCustomCategoryInput = false;
+    String? customCategory;
+    bool showCustomSubcategoryInput = false;
+    List<Account> availableAccounts = _accounts;
+
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(isIncome ? 'Добавить доход' : 'Добавить расход'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                DropdownButtonFormField<Account>(
+                  decoration: const InputDecoration(labelText: 'Счёт'),
+                  value: selectedAccount,
+                  items: availableAccounts.map((account) {
+                    return DropdownMenuItem<Account>(
+                      value: account,
+                      child: Text(account.name, overflow: TextOverflow.ellipsis),
+                    );
+                  }).toList(),
+                  onChanged: (value) => setDialogState(() => selectedAccount = value),
+                  validator: (value) => value == null ? 'Выберите счёт' : null,
+                ),
+                DropdownButtonFormField<dynamic>(
+                  decoration: const InputDecoration(labelText: 'Категория (необязательно)'),
+                  items: [
+                    const DropdownMenuItem<dynamic>(
+                      value: null,
+                      child: Text('Без категории', overflow: TextOverflow.ellipsis),
+                    ),
+                    ...(isIncome ? incomeCategories : expenseCategories).map((category) {
+                      return DropdownMenuItem<dynamic>(
+                        value: category,
+                        child: Text(category.name, overflow: TextOverflow.ellipsis),
+                      );
+                    }),
+                    if (isIncome) ...widget.goals.map((goal) => DropdownMenuItem<dynamic>(
+                      value: 'На цель: ${goal.description}',
+                      child: Text('На цель: ${goal.description}', overflow: TextOverflow.ellipsis),
+                    )),
+                    const DropdownMenuItem<dynamic>(
+                      value: 'custom',
+                      child: Text('Добавить свою', overflow: TextOverflow.ellipsis),
+                    ),
+                  ],
+                  onChanged: (value) {
+                    setDialogState(() {
+                      if (value == 'custom') {
+                        showCustomCategoryInput = true;
+                        selectedCategory = null;
+                        customCategory = null;
+                        selectedSubcategory = null;
+                        showCustomSubcategoryInput = false;
+                        availableAccounts = _accounts;
+                      } else if (value is String && value.startsWith('На цель: ')) {
+                        showCustomCategoryInput = false;
+                        selectedCategory = null;
+                        customCategory = value;
+                        selectedSubcategory = null;
+                        showCustomSubcategoryInput = false;
+                        final goalDescription = value.replaceFirst('На цель: ', '');
+                        final goal = widget.goals.firstWhere((g) => g.description == goalDescription);
+                        availableAccounts = _accounts.where((acc) => acc.name == goal.accountName).toList();
+                        selectedAccount = availableAccounts.isNotEmpty ? availableAccounts.first : null;
+                      } else {
+                        showCustomCategoryInput = false;
+                        selectedCategory = value;
+                        customCategory = null;
+                        selectedSubcategory = null;
+                        showCustomSubcategoryInput = false;
+                        availableAccounts = _accounts;
+                      }
+                    });
+                  },
+                ),
+                if (showCustomCategoryInput) ...[
+                  TextFormField(
+                    decoration: const InputDecoration(labelText: 'Своя категория'),
+                    onChanged: (value) => setDialogState(() {
+                      customCategory = value.isEmpty ? null : value;
+                      if (value.isNotEmpty) showCustomSubcategoryInput = true;
+                    }),
+                  ),
+                  if (showCustomSubcategoryInput)
+                    TextFormField(
+                      decoration: const InputDecoration(labelText: 'Своя подкатегория (необязательно)'),
+                      onChanged: (value) => setDialogState(() => selectedSubcategory = value.isEmpty ? null : value),
+                    ),
+                ],
+                if (selectedCategory != null)
+                  DropdownButtonFormField<String>(
+                    decoration: const InputDecoration(labelText: 'Подкатегория (необязательно)'),
+                    items: [
+                      const DropdownMenuItem<String>(
+                        value: null,
+                        child: Text('Без подкатегории', overflow: TextOverflow.ellipsis),
+                      ),
+                      ...selectedCategory!.subcategories.map((subcategory) {
+                        return DropdownMenuItem<String>(
+                          value: subcategory,
+                          child: Text(subcategory, overflow: TextOverflow.ellipsis),
+                        );
+                      }),
+                      const DropdownMenuItem<String>(
+                        value: 'custom',
+                        child: Text('Добавить свою', overflow: TextOverflow.ellipsis),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      setDialogState(() {
+                        if (value == 'custom') {
+                          showCustomSubcategoryInput = true;
+                          selectedSubcategory = null;
+                        } else {
+                          showCustomSubcategoryInput = false;
+                          selectedSubcategory = value;
+                        }
+                      });
+                    },
+                  ),
+                if (showCustomSubcategoryInput && !showCustomCategoryInput)
+                  TextFormField(
+                    decoration: const InputDecoration(labelText: 'Своя подкатегория'),
+                    onChanged: (value) => setDialogState(() => selectedSubcategory = value.isEmpty ? null : value),
+                  ),
+                TextFormField(
+                  decoration: const InputDecoration(labelText: 'Сумма'),
+                  keyboardType: TextInputType.number,
+                  onChanged: (value) => amount = double.tryParse(value) ?? 0.0,
+                  validator: (value) =>
+                  value!.isEmpty || double.tryParse(value) == null ? 'Введите сумму' : null,
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Отмена'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                if (selectedAccount != null && amount > 0) {
+                  try {
+                      final storage = FlutterSecureStorage();
+                      final token = await storage.read(key: 'auth_token');
+
+                      if (token == null) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(content: Text('Ошибка: токен отсутствует')),
+                        );
+                        return;
+                      }
+                      await selectedAccount!.registerTransaction(
+                      amount: isIncome ? amount : -amount, // исправлено
+
+                        token: token,
+                      category: customCategory ?? selectedCategory?.name,
+                      subcategory: selectedSubcategory,
+                    );
+                      await _syncAccounts();
+
+                    setState(() {}); // Обновляем UI
+                    Navigator.pop(context);
+                  } catch (e) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Ошибка: $e')),
+                    );
+                  }
+                }
+              },
+              child: const Text('Добавить'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showTransferDialog(BuildContext context) {
+    Account? fromAccount;
+    Account? toAccount;
+    double amount = 0.0;
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Перевод между счетами'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            DropdownButtonFormField<Account>(
+              decoration: const InputDecoration(labelText: 'Откуда'),
+              items: _accounts.map((account) {
+                return DropdownMenuItem<Account>(
+                  value: account,
+                  child: Text(account.name, overflow: TextOverflow.ellipsis),
+                );
+              }).toList(),
+              onChanged: (value) => fromAccount = value,
+              validator: (value) => value == null ? 'Выберите счёт' : null,
+            ),
+            DropdownButtonFormField<Account>(
+              decoration: const InputDecoration(labelText: 'Куда'),
+              items: _accounts.map((account) {
+                return DropdownMenuItem<Account>(
+                  value: account,
+                  child: Text(account.name, overflow: TextOverflow.ellipsis),
+                );
+              }).toList(),
+              onChanged: (value) => toAccount = value,
+              validator: (value) => value == null ? 'Выберите счёт' : null,
+            ),
+            TextFormField(
+              decoration: const InputDecoration(labelText: 'Сумма'),
+              keyboardType: TextInputType.number,
+              onChanged: (value) => amount = double.tryParse(value) ?? 0.0,
+              validator: (value) =>
+              value!.isEmpty || double.tryParse(value) == null ? 'Введите сумму' : null,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Отмена'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              if (fromAccount != null && toAccount != null && amount > 0) {
+                try {
+                  final storage = FlutterSecureStorage();
+                  final token = await storage.read(key: 'auth_token');
+
+                  if (token == null) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Ошибка: токен отсутствует')),
+                    );
+                    return;
+                  }
+
+                  await fromAccount!.registerTransaction(
+                    amount: -amount,
+                    token: token,
+                    transferTo: toAccount!.name,
+                  );
+
+                  await toAccount!.registerTransaction(
+                    amount: amount,
+                    token: token,
+                    transferTo: fromAccount!.name,
+                  );
+
+                  setState(() {});
+                  Navigator.pop(context);
+                } catch (e) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Ошибка перевода: $e')),
+                  );
+                }
+              }
+            },
+            child: const Text('Перевести'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showProfile(BuildContext context) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => ProfileScreen(
+          family: widget.family,
+          currentUser: widget.currentUser,
+          accounts: _accounts,
+          onRemoveFamilyMember: (user) {
+            setState(() {
+              widget.family.users.removeWhere((u) => u.email == user.email);
+            });
+          },
+          onUpdateRole: (user, newRole) {
+            setState(() {
+              final index = widget.family.users.indexWhere((u) => u.email == user.email);
+              if (index != -1) {
+                widget.family.users[index] = user.copyWith(role: newRole);
+              }
+            });
+          },
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isLoading) {
+      return const Scaffold(
+        body: Center(
+          child: CircularProgressIndicator(),
+        ),
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Расходы семьи'),
+        actions: [
+          if (widget.currentUser.role == UserRole.admin)
+            IconButton(
+              icon: const Icon(Icons.group),
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => FamilyManagementScreen(
+                      familyUsers: widget.family.users,
+                      onAddFamilyMember: (newUser) {
+                        setState(() {
+                          widget.family.users.add(newUser);
+                        });
+                      },
+                      onRemoveFamilyMember: (user) {
+                        setState(() {
+                          widget.family.users.removeWhere((u) => u.email == user.email);
+                        });
+                      },
+                      onUpdateRole: (user, newRole) {
+                        setState(() {
+                          final index = widget.family.users.indexWhere((u) => u.email == user.email);
+                          if (index != -1) {
+                            widget.family.users[index] = user.copyWith(role: newRole);
+                          }
+                        });
+                      },
+                    ),
+                  ),
+                );
+              },
+              tooltip: 'Управление семьёй',
+            ),
+          IconButton(
+            icon: const Icon(Icons.person),
+            onPressed: () => _showProfile(context),
+            tooltip: 'Профиль',
+          ),
+        ],
+      ),
+
+      body: RefreshIndicator(
+        onRefresh: _refreshAccounts,
+        child: SingleChildScrollView( // Оберните в SingleChildScrollView
+          physics: const AlwaysScrollableScrollPhysics(), // Важно для работы RefreshIndicator
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Text(
+                  'Баланс: ${totalBalance.toStringAsFixed(2)} руб.',
+                  style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+                ),
+              ),
+              ListView.separated(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: _accounts.length,
+                itemBuilder: (context, index) {
+                  final account = _accounts[index];
+                  return ListTile(
+                    title: Text(account.name),
+                    subtitle: Text(account.type),
+                    trailing: Text('${account.balance.toStringAsFixed(2)} ${account.currency}'),
+                  );
+                },
+                separatorBuilder: (context, index) => const Divider(height: 1),
+              ),
+              ListView.builder( // Измените на ListView.builder без Expanded
+                shrinkWrap: true, // Важно!
+                physics: const NeverScrollableScrollPhysics(), // Отключаем внутренний скролл
+                itemCount: _accounts.length,
+                itemBuilder: (context, index) {
+                  final account = _accounts[index];
+                  return ListTile(
+                    title: Text(account.name),
+                    subtitle: Text(account.type),
+                    trailing: Text('${account.balance.toStringAsFixed(2)} ${account.currency}'),
+                  );
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+
+
+      floatingActionButton: widget.onAddAccount != null
+          ? FloatingActionButton(
+        onPressed: () => _showAddMenu(context),
+        child: const Icon(Icons.add),
+      )
+          : null,
+    );
+  }
+}
+
+// ===== File: lib\screens\profile_screen.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'package:flutter/material.dart';
+import '../models/user.dart';
+import '../models/family.dart';
+import '../models/account.dart'; // Добавлен импорт Account
+import 'budget_calculation_screen.dart';
+import 'family_management_screen.dart';
+
+class ProfileScreen extends StatelessWidget {
+  final Family family;
+  final User currentUser;
+  final List<Account> accounts;
+  final Function(User)? onRemoveFamilyMember;
+  final Function(User, UserRole)? onUpdateRole;
+
+  const ProfileScreen({
+    required this.family,
+    required this.currentUser,
+    required this.accounts,
+    this.onRemoveFamilyMember,
+    this.onUpdateRole,
+    Key? key,
+  }) : super(key: key);
+
+  void _showFeatureInDevelopment(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Функция в разработке'),
+        content: const Text('Данная функция будет доступна в следующем обновлении.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showThemeSelection(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Выбор темы'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.light_mode),
+              title: const Text('Светлая тема'),
+              onTap: () {
+                // Реализация смены темы
+                Navigator.pop(context);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.dark_mode),
+              title: const Text('Темная тема'),
+              onTap: () {
+                // Реализация смены темы
+                Navigator.pop(context);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.settings_suggest),
+              title: const Text('Системная тема'),
+              onTap: () {
+                // Реализация смены темы
+                Navigator.pop(context);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showNotificationSettings(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Настройки уведомлений'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SwitchListTile(
+              title: const Text('Операции по счетам'),
+              value: true,
+              onChanged: (value) {},
+            ),
+            SwitchListTile(
+              title: const Text('Напоминания об оплате'),
+              value: true,
+              onChanged: (value) {},
+            ),
+            SwitchListTile(
+              title: const Text('Финансовые отчеты'),
+              value: true,
+              onChanged: (value) {},
+            ),
+            SwitchListTile(
+              title: const Text('Новости и советы'),
+              value: true,
+              onChanged: (value) {},
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Сохранить'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showCurrencySettings(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Настройки валюты'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            RadioListTile<String>(
+              title: const Text('Рубли (RUB)'),
+              value: 'RUB',
+              groupValue: 'RUB',
+              onChanged: (value) {},
+            ),
+            RadioListTile<String>(
+              title: const Text('Доллары (USD)'),
+              value: 'USD',
+              groupValue: 'RUB',
+              onChanged: (value) {},
+            ),
+            RadioListTile<String>(
+              title: const Text('Евро (EUR)'),
+              value: 'EUR',
+              groupValue: 'RUB',
+              onChanged: (value) {},
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Применить'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showLogoutConfirmation(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Выход из аккаунта'),
+        content: const Text('Вы уверены, что хотите выйти?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Отмена'),
+          ),
+          TextButton(
+            onPressed: () {
+              // Реализация выхода
+              Navigator.popUntil(context, (route) => route.isFirst);
+            },
+            child: const Text('Выйти', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Профиль')),
+      body: ListView(
+        padding: const EdgeInsets.all(16.0),
+        children: [
+          // Информация о пользователе
+          Card(
+            elevation: 3,
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Row(
+                children: [
+                  const CircleAvatar(
+                    radius: 30,
+                    child: Icon(Icons.person),
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          currentUser.name,
+                          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                        ),
+                        Text(
+                          currentUser.email,
+                          style: const TextStyle(fontSize: 14, color: Colors.grey),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Роль: ${currentUser.role.toString().split('.').last}',
+                          style: const TextStyle(fontSize: 14),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 20),
+
+          // Основные функции
+          _buildSectionTitle('Финансы'),
+          _MenuItem(
+            icon: Icons.calculate,
+            title: 'Рассчитать бюджет',
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => BudgetCalculationScreen(
+                    accounts: accounts,
+                  ),
+                ),
+              );
+            },
+          ),
+          _MenuItem(
+            icon: Icons.calendar_today,
+            title: 'Платежный календарь',
+            onTap: () => _showFeatureInDevelopment(context),
+          ),
+          _MenuItem(
+            icon: Icons.notifications_active,
+            title: 'Напоминания об оплате',
+            onTap: () => _showFeatureInDevelopment(context),
+          ),
+
+          // Настройки
+          _buildSectionTitle('Настройки'),
+          _MenuItem(
+            icon: Icons.color_lens,
+            title: 'Тема оформления',
+            onTap: () => _showThemeSelection(context),
+          ),
+          _MenuItem(
+            icon: Icons.notifications,
+            title: 'Уведомления',
+            onTap: () => _showNotificationSettings(context),
+          ),
+          _MenuItem(
+            icon: Icons.currency_exchange,
+            title: 'Настройки валюты',
+            onTap: () => _showCurrencySettings(context),
+          ),
+
+          // Обучение
+          _buildSectionTitle('Обучение'),
+          _MenuItem(
+            icon: Icons.article,
+            title: 'Статьи и советы',
+            onTap: () => _showFeatureInDevelopment(context),
+          ),
+
+          // Управление семьей (только для админа)
+          if (currentUser.role == UserRole.admin) ...[
+            _buildSectionTitle('Управление семьей'),
+            _MenuItem(
+              icon: Icons.group,
+              title: 'Управление семьёй',
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => FamilyManagementScreen(
+                      familyUsers: family.users,
+                      onAddFamilyMember: (newUser) {
+                        Navigator.pop(context);
+                        family.users.add(newUser);
+                      },
+                      onRemoveFamilyMember: onRemoveFamilyMember ?? (user) {
+                        family.users.removeWhere((u) => u.email == user.email);
+                      },
+                      onUpdateRole: onUpdateRole ?? (user, newRole) {
+                        final index = family.users.indexWhere((u) => u.email == user.email);
+                        if (index != -1) {
+                          family.users[index] = user.copyWith(role: newRole);
+                        }
+                      },
+                    ),
+                  ),
+                );
+              },
+            ),
+          ],
+
+          // Выход
+          _buildSectionTitle('Аккаунт'),
+          _MenuItem(
+            icon: Icons.exit_to_app,
+            title: 'Выход',
+            color: Colors.red,
+            onTap: () => _showLogoutConfirmation(context),
+          ),
+          const SizedBox(height: 30),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSectionTitle(String title) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 20, bottom: 10),
+      child: Text(
+        title,
+        style: const TextStyle(
+          fontSize: 16,
+          fontWeight: FontWeight.bold,
+          color: Colors.blue,
+        ),
+      ),
+    );
+  }
+}
+
+// Виджет для пункта меню вместо функции
+class _MenuItem extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final VoidCallback onTap;
+  final Color? color;
+
+  const _MenuItem({
+    required this.icon,
+    required this.title,
+    required this.onTap,
+    this.color,
+    Key? key,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      elevation: 2,
+      child: ListTile(
+        leading: Icon(icon, color: color ?? Theme.of(context).primaryColor),
+        title: Text(title, style: TextStyle(color: color)),
+        trailing: const Icon(Icons.chevron_right),
+        onTap: onTap,
+      ),
+    );
+  }
+}
+
+// ===== File: lib\screens\registration_screen.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import '../models/user.dart';
+import '../services/api_service.dart';
+import '../models/family.dart';
+import 'main_navigation.dart';
+
+class RegistrationScreen extends StatefulWidget {
+  @override
+  _RegistrationScreenState createState() => _RegistrationScreenState();
+}
+
+class _RegistrationScreenState extends State<RegistrationScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _storage = FlutterSecureStorage();
+
+  String _name = '';
+  String _email = '';
+  String _password = '';
+  String _inviteCode = ''; // Поле для инвайт-кода
+  bool _isLoading = false;
+  bool _obscurePassword = true;
+
+  Future<void> _register() async {
+    if (_formKey.currentState!.validate()) {
+      setState(() => _isLoading = true);
+      _formKey.currentState!.save();
+
+      try {
+        User newUser;
+
+        if (_inviteCode.isNotEmpty) {
+          // Регистрация с инвайт-кодом
+          newUser = await ApiService.joinFamily(
+            inviteCode: _inviteCode,
+            name: _name,
+            email: _email,
+            password: _password,
+          );
+        } else {
+          // Обычная регистрация (создание новой семьи)
+          newUser = await ApiService.register(
+            name: _name,
+            email: _email,
+            password: _password,
+          );
+        }
+
+        // Автоматический вход после регистрации
+        final loggedInUser = await ApiService.login(_email, _password);
+        await _storage.write(key: 'auth_token', value: loggedInUser.token!);
+
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (_) => MainNavigation(
+              family: Family(
+                id: loggedInUser.familyId,
+                name: "Семья ${loggedInUser.name}",
+                users: [loggedInUser],
+                inviteCode: '', // Сервер должен вернуть актуальный код
+              ),
+            ),
+          ),
+        );
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Регистрация и вход выполнены успешно!')),
+        );
+
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Ошибка: ${e.toString()}')),
+        );
+      } finally {
+        if (mounted) {
+          setState(() => _isLoading = false);
+        }
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Регистрация'),
+        centerTitle: true,
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Form(
+          key: _formKey,
+          child: ListView(
+            children: [
+              TextFormField(
+                decoration: InputDecoration(
+                  labelText: 'Имя',
+                  prefixIcon: Icon(Icons.person),
+                  border: OutlineInputBorder(),
+                ),
+                validator: (value) {
+                  if (value == null || value.isEmpty) {
+                    return 'Пожалуйста, введите имя';
+                  }
+                  return null;
+                },
+                onSaved: (value) => _name = value!.trim(),
+              ),
+              SizedBox(height: 20),
+              TextFormField(
+                decoration: InputDecoration(
+                  labelText: 'Email',
+                  prefixIcon: Icon(Icons.email),
+                  border: OutlineInputBorder(),
+                ),
+                keyboardType: TextInputType.emailAddress,
+                validator: (value) {
+                  if (value == null || value.isEmpty) {
+                    return 'Пожалуйста, введите email';
+                  }
+                  if (!RegExp(r'^[^@]+@[^@]+\.[^@]+').hasMatch(value)) {
+                    return 'Введите корректный email';
+                  }
+                  return null;
+                },
+                onSaved: (value) => _email = value!.trim().toLowerCase(),
+              ),
+              SizedBox(height: 20),
+              TextFormField(
+                decoration: InputDecoration(
+                  labelText: 'Пароль',
+                  prefixIcon: Icon(Icons.lock),
+                  suffixIcon: IconButton(
+                    icon: Icon(
+                      _obscurePassword ? Icons.visibility : Icons.visibility_off,
+                    ),
+                    onPressed: () {
+                      setState(() => _obscurePassword = !_obscurePassword);
+                    },
+                  ),
+                  border: OutlineInputBorder(),
+                ),
+                obscureText: _obscurePassword,
+                validator: (value) {
+                  if (value == null || value.isEmpty) {
+                    return 'Пожалуйста, введите пароль';
+                  }
+                  if (value.length < 8) {
+                    return 'Пароль должен содержать минимум 8 символов';
+                  }
+                  return null;
+                },
+                onSaved: (value) => _password = value!,
+              ),
+              SizedBox(height: 20),
+              TextFormField(
+                decoration: InputDecoration(
+                  labelText: 'Код приглашения (если есть)',
+                  hintText: 'Оставьте пустым для создания новой семьи',
+                  prefixIcon: Icon(Icons.group_add),
+                  border: OutlineInputBorder(),
+                ),
+                onSaved: (value) => _inviteCode = value ?? '',
+              ),
+              SizedBox(height: 30),
+              ElevatedButton(
+                onPressed: _isLoading ? null : _register,
+                style: ElevatedButton.styleFrom(
+                  padding: EdgeInsets.symmetric(vertical: 15),
+                ),
+                child: _isLoading
+                    ? CircularProgressIndicator(color: Colors.white)
+                    : Text(
+                  'ЗАРЕГИСТРИРОВАТЬСЯ',
+                  style: TextStyle(fontSize: 16),
+                ),
+              ),
+              SizedBox(height: 15),
+              TextButton(
+                onPressed: _isLoading
+                    ? null
+                    : () => Navigator.pushReplacementNamed(context, '/login'),
+                child: Text(
+                  'Уже есть аккаунт? Войти',
+                  style: TextStyle(fontSize: 16),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ===== File: lib\screens\test.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+
+
+// ===== File: lib\services\api_service.dart =====
+// Last updated: 2025-06-29 23:19:02
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:http/http.dart' as http;
+import '../models/user.dart';
+import '../models/account.dart';
+import '../models/financial_goal.dart';
+import '../models/account_history.dart';
+
+class ApiService {
+  static const String _baseUrl = 'http://10.0.2.2:5000';
+  static const FlutterSecureStorage _storage = FlutterSecureStorage();
+
+  // Тест подключения
+  static Future<void> testConnection() async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/test'),
+        headers: {'Content-Type': 'application/json'},
+      ).timeout(const Duration(seconds: 5));
+
+      print('Response status: ${response.statusCode}');
+      print('Response body: ${response.body}');
+    } catch (e) {
+      print('Connection test error: $e');
+    }
+  }
+
+  // Регистрация
+  static Future<User> register({
+    required String name,
+    required String email,
+    required String password,
+  }) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$_baseUrl/register'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'name': name,
+          'email': email,
+          'password': password,
+        }),
+      ).timeout(const Duration(seconds: 30));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final user = User.fromJson(data['user']);
+
+        // Сохраняем токен
+        await _storage.write(key: 'auth_token', value: user.token);
+
+        return user;
+      } else {
+        final errorData = jsonDecode(response.body);
+        throw Exception(errorData['error'] ?? 'Ошибка регистрации: ${response.statusCode}');
+      }
+    } catch (e) {
+      print('Registration error: $e');
+      throw Exception('Ошибка регистрации: $e');
+    }
+  }
+//Тат
+  // Добавление счета
+  static Future<void> addAccount({
+    required String token,
+    required Account account,
+  }) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$_baseUrl/accounts'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+        body: jsonEncode(account.toJson()), // Только данные счета
+      );
+
+      if (response.statusCode == 201) {
+        final responseData = jsonDecode(response.body);
+        account.id = responseData['account']['id'];
+      } else {
+        throw Exception('Failed to add account: ${response.body}');
+      }
+    } catch (e) {
+      print('Add account error: $e');
+      rethrow;
+    }
+  }
+
+  // Вход
+  static Future<User> login(String email, String password) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$_baseUrl/login'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'email': email, 'password': password}),
+      ).timeout(const Duration(seconds: 30));
+
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200) {
+        final user = User.fromJson(data['user']);
+
+        // Сохраняем токен в secure storage
+        await _storage.write(key: 'auth_token', value: user.token);
+
+        return user;
+      } else {
+        throw Exception(data['error'] ?? 'Ошибка входа');
+      }
+    } catch (e) {
+      print('[ERROR] Login error: $e');
+      rethrow;
+    }
+  }
+
+  // Получение профиля
+  static Future<User> getProfile(String token) async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/profile'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+      ).timeout(const Duration(seconds: 10));
+
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200) {
+        return User.fromJson(data);
+      } else {
+        throw Exception(data['error'] ?? 'Ошибка получения профиля');
+      }
+    } on SocketException {
+      throw Exception('Нет подключения к серверу');
+    } catch (e) {
+      if (e is TimeoutException) {
+        throw Exception('Превышено время ожидания');
+      }
+      throw Exception('Ошибка: ${e.toString()}');
+    }
+  }
+
+  // Присоединение к семье
+  static Future<User> joinFamily({
+    required String inviteCode,
+    required String name,
+    required String email,
+    required String password,
+  }) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$_baseUrl/join-family'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'inviteCode': inviteCode,
+          'name': name,
+          'email': email,
+          'password': password,
+        }),
+      ).timeout(const Duration(seconds: 30));
+
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200) {
+        return User.fromJson(data['user']);
+      } else {
+        throw Exception(data['error'] ?? 'Ошибка присоединения к семье');
+      }
+    } catch (e) {
+      print('Join family error: $e');
+      throw Exception('Не удалось присоединиться к семье. Проверьте код приглашения');
+    }
+  }
+
+  // Получение счетов
+  static Future<List<Account>> getAccounts(String token) async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/accounts'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final accounts = (data['accounts'] as List)
+            .map((json) => Account.fromJson(json))
+            .toList();
+        print('Received accounts: ${accounts.length}');
+        accounts.forEach((account) => print(' - ${account.name}: ${account.balance}'));
+        return accounts;
+      }
+      throw Exception('Failed to load accounts: ${response.body}');
+    } catch (e) {
+      print('Accounts loading error: $e');
+      rethrow;
+    }
+  }
+
+  // Получение целей
+  static Future<List<FinancialGoal>> getGoals(String token) async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/financial-goals'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as List;
+        return data.map((json) => FinancialGoal.fromJson(json)).toList();
+      }
+      throw Exception('Failed to load goals');
+    } catch (e) {
+      print('Goals loading error: $e');
+      rethrow;
+    }
+  }
+
+  // Добавление операции
+  static Future<void> addTransaction({
+    required String token,
+    required String accountId,
+    required double amount,
+    required String type,
+    String? relatedAccount,
+    String? category,
+    String? subcategory,
+  }) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$_baseUrl/accounts/$accountId/history'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+        body: jsonEncode({
+          'amount': amount,
+          'type': type,
+          'related_account': relatedAccount,
+          'category': category,
+          'subcategory': subcategory,
+        }),
+      );
+
+      if (response.statusCode != 201) {
+        throw Exception('Failed to add transaction: ${response.body}');
+      }
+    } catch (e) {
+      print('Add transaction error: $e');
+      rethrow;
+    }
+  }
+
+  // Получение истории операций
+  static Future<List<AccountHistory>> getAccountHistory(
+      String token,
+      String accountId
+      ) async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/accounts/$accountId/history'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body)['history'] as List;
+        return data.map((json) => AccountHistory.fromJson(json)).toList();
+      }
+      throw Exception('Failed to load history');
+    } catch (e) {
+      print('History loading error: $e');
+      rethrow;
+    }
+  }
+}
