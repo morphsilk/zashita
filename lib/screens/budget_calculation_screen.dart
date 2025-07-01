@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../models/account.dart';
 import '../models/account_history.dart';
+import 'expense_optimization_screen.dart';
 
 class BudgetCalculationScreen extends StatefulWidget {
   final List<Account> accounts;
@@ -368,26 +369,54 @@ class _BudgetCalculationScreenState extends State<BudgetCalculationScreen> {
       elevation: 4,
       child: Padding(
         padding: const EdgeInsets.all(16.0),
-        child: Row(
+        child: Column(
           children: [
-            Icon(icon, color: color, size: 40),
-            const SizedBox(width: 16),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(title, style: const TextStyle(fontSize: 16)),
-                  Text(
-                    '${value.toStringAsFixed(2)} руб.',
-                    style: TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.bold,
-                      color: color,
-                    ),
+            Row(
+              children: [
+                Icon(icon, color: color, size: 40),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(title, style: const TextStyle(fontSize: 16)),
+                      Text(
+                        '${value.toStringAsFixed(2)} руб.',
+                        style: TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                          color: color,
+                        ),
+                      ),
+                    ],
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
+            // Добавляем кнопку только для незапланированных расходов
+            if (title == 'Незапланированные расходы' && value > 0) ...[
+              const SizedBox(height: 12),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red.withOpacity(0.1),
+                  foregroundColor: Colors.red,
+                ),
+                onPressed: () {
+                  final metrics = calculateBudgetMetrics();
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => ExpenseOptimizationScreen(
+                        totalUnplannedExpenses: value,
+                        unplannedExpensesByCategory:
+                        metrics['unplannedExpensesByCategory'] as Map<String, double>,
+                      ),
+                    ),
+                  );
+                },
+                child: const Text('Оптимизировать расходы'),
+              ),
+            ],
           ],
         ),
       ),
